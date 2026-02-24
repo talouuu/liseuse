@@ -1,7 +1,7 @@
 {
   "name": "Liseuse — PDF Read Aloud",
   "short_name": "Liseuse",
-  "description": "Apple Books–inspired PDF read-aloud PWA with French & English voices",
+  "description": "PDF read-aloud PWA with natural AI voices",
   "start_url": "./index.html",
   "display": "standalone",
   "orientation": "portrait",

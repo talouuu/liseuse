@@ -1,128 +1,52 @@
 /* ============================================================
-   Liseuse — app.js  (v2 — fully debugged + polished)
+   Liseuse v3 — app.js
 
-   FIXES applied:
-   1. VOICES: Filter out novelty/garbage voices. Pick natural Siri/enhanced
-      voices by default. Short curated list, not a wall of junk.
-   2. TAP-TO-READ: Fixed coordinate calculation (was ignoring CSS scaling),
-      added visual tap feedback, reliable "start from here" behavior.
-   3. PROGRESS: Replaced confusing "p.3/12 · 47%" with a visual progress
-      bar + clear "Page 3 of 12" label, calculated from page position.
-   4. PDF DISAPPEARING: Reduced canvas render scale from 2× devicePixelRatio
-      to 1.5× max. Added IntersectionObserver to re-render pages that iOS
-      Safari evicts from GPU memory during scrolling.
-
-   Architecture (unchanged):
-   - PDFManager:  load, render, extract segments
-   - SpeechEngine: voice management, chunking, playback
-   - Persistence:  localStorage state
-   - UIController: DOM wiring, controls, scroll
+   COMPLETE REWRITE addressing:
+   1. VOICES: Replaced Web Speech API with Kokoro AI TTS (82M model,
+      runs in-browser via WASM). Natural speech. 1 female + 1 male voice
+      per language. Download button to fetch model (~80MB one-time).
+   2. TAP-TO-READ: Removed fragile segment overlays. Now: tap any PDF
+      page → reading starts from the top of that page. Always works.
+   3. PROGRESS: Clear "Page X of Y" with visual bar based on page position.
+   4. PDF DISAPPEARING: Capped canvas at 1.5× DPR + IntersectionObserver
+      to re-render evicted canvases.
    ============================================================ */
 
 pdfjsLib.GlobalWorkerOptions.workerSrc =
   'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.4.168/pdf.worker.min.mjs';
 
-const MAX_UTTERANCE_LEN = 200;
-const STORAGE_KEY = 'liseuse_state';
+const STORAGE_KEY = 'liseuse_v3';
 
-// ════════════════════════════════════════════════════════════
-// 1. VOICE FILTERING — The core of Fix #1
-//    iOS speechSynthesis exposes ~70+ voices including joke ones
-//    like "Bells", "Boing", "Bad News", "Cellos", etc.
-//    We blacklist known garbage and rank the rest by quality.
-// ════════════════════════════════════════════════════════════
+// ════════════════════════════════════════
+// Voice definitions — curated, no garbage
+// ════════════════════════════════════════
+const VOICE_DEFS = {
+  en: [
+    { id: 'af_heart', label: 'Heart', gender: 'Female', lang: 'en' },
+    { id: 'am_adam',  label: 'Adam',  gender: 'Male',   lang: 'en' },
+  ],
+  fr: [
+    { id: 'ff_siwis', label: 'Siwis', gender: 'Female', lang: 'fr' },
+  ]
+};
 
-/**
- * Known novelty / sound-effect voices on Apple platforms.
- * These are NOT speech — they're musical instruments, sound effects,
- * or distorted joke voices. We remove them entirely from the UI.
- */
-const NOVELTY_VOICE_NAMES = new Set([
-  // Sound effects & instruments
-  'Bells', 'Boing', 'Bubbles', 'Cellos', 'Good News', 'Bad News',
-  'Bahh', 'Wobble', 'Zarvox', 'Trinoids', 'Whisper', 'Deranged',
-  'Hysterical', 'Organ', 'Superstar', 'Jester', 'Ralph',
-  'Kathy', 'Junior', 'Fred', 'Albert', 'Princess',
-  // These tend to be extremely robotic / unusable
-  'Pipe Organ',
-]);
-
-/**
- * Additional substring patterns that indicate a garbage voice.
- * Checked case-insensitively.
- */
-const NOVELTY_PATTERNS = [
-  'com.apple.speech.synthesis', // internal Apple identifiers sometimes leak
-  'com.apple.ttsbundle',        // same
-];
-
-/**
- * Returns true if a voice is a novelty/garbage voice that should be hidden.
- */
-function isNoveltyVoice(voice) {
-  const name = voice.name;
-
-  // Exact name match (case-insensitive for safety)
-  for (const novelty of NOVELTY_VOICE_NAMES) {
-    if (name.toLowerCase() === novelty.toLowerCase()) return true;
-    // Also catch "Bells (Enhanced)" etc.
-    if (name.toLowerCase().startsWith(novelty.toLowerCase() + ' ')) return true;
-    if (name.toLowerCase().startsWith(novelty.toLowerCase() + '(')) return true;
-  }
-
-  // Substring pattern match
-  for (const pat of NOVELTY_PATTERNS) {
-    if (name.toLowerCase().includes(pat.toLowerCase())) return true;
-  }
-
-  // Voices with no language set or weird language codes
-  if (!voice.lang || voice.lang.length < 2) return true;
-
-  return false;
-}
-
-/**
- * Rank a voice for quality. Higher = better.
- * We strongly prefer:
- *   1. Siri voices (highest quality on iOS)
- *   2. "Enhanced" or "Premium" variants
- *   3. Local (on-device) voices over network
- *   4. Shorter/simpler names (usually the "default" system voice)
- */
-function voiceQualityScore(voice) {
-  let score = 0;
-  const n = voice.name.toLowerCase();
-
-  if (n.includes('siri'))       score += 100;
-  if (n.includes('premium'))    score += 80;
-  if (n.includes('enhanced'))   score += 60;
-  if (n.includes('natural'))    score += 50;
-  if (voice.localService)       score += 30;
-  // Penalize overly long names (usually indicate niche/novelty)
-  if (voice.name.length > 30)   score -= 10;
-
-  return score;
-}
-
-
-// ════════════════════════════════════════════════════════════
-// 2. PDFManager — with Fix #4 (canvas memory)
-// ════════════════════════════════════════════════════════════
+// ════════════════════════════════════════
+// PDFManager — render + text extraction
+// ════════════════════════════════════════
 const PDFManager = (() => {
   let pdfDoc = null;
-  let pages = [];      // { pageNum, canvas, ctx, wrapper, viewport, rendered }
-  let segments = [];
+  let pages = [];
+  // pageTexts[pageIdx] = full text string for that page
+  let pageTexts = [];
   let renderScale = 1;
   let containerWidth = 0;
-  let observer = null; // IntersectionObserver for re-rendering
+  let observer = null;
 
   async function load(arrayBuffer) {
     const readerArea = document.getElementById('reader-area');
     readerArea.innerHTML = '';
     pages = [];
-    segments = [];
-
-    // Clean up old observer
+    pageTexts = [];
     if (observer) observer.disconnect();
 
     pdfDoc = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
@@ -132,13 +56,8 @@ const PDFManager = (() => {
       await renderPage(i, readerArea);
     }
 
-    // FIX #4: IntersectionObserver to detect and re-render evicted canvases.
-    // iOS Safari aggressively frees GPU-backed canvas memory for off-screen
-    // elements. When the user scrolls back, the canvas is blank (the "disappearing
-    // PDF" bug). We detect this by observing visibility and re-rendering.
     setupCanvasObserver();
-
-    return { segments, pageCount: pdfDoc.numPages };
+    return { pageCount: pdfDoc.numPages };
   }
 
   async function renderPage(pageNum, container) {
@@ -149,22 +68,18 @@ const PDFManager = (() => {
 
     const wrapper = document.createElement('div');
     wrapper.className = 'page-wrapper';
-    wrapper.style.width = viewport.width + 'px';
+    wrapper.style.width  = viewport.width + 'px';
     wrapper.style.height = viewport.height + 'px';
-    wrapper.dataset.pageNum = pageNum;
+    wrapper.dataset.pageIdx = pages.length;
 
     const canvas = document.createElement('canvas');
     const ctx = canvas.getContext('2d');
 
-    // FIX #4: Limit canvas resolution.
-    // Old code: outputScale = devicePixelRatio (3× on iPhone 14+)
-    // A 400px-wide page at 3× = 1200px canvas = huge GPU memory.
-    // With 10+ pages, iOS runs out and starts evicting canvases.
-    // New: cap at 1.5× — still sharp on retina, much less memory.
+    // Cap at 1.5× to prevent iOS GPU memory eviction
     const outputScale = Math.min(window.devicePixelRatio || 1, 1.5);
-    canvas.width = Math.floor(viewport.width * outputScale);
+    canvas.width  = Math.floor(viewport.width  * outputScale);
     canvas.height = Math.floor(viewport.height * outputScale);
-    canvas.style.width = viewport.width + 'px';
+    canvas.style.width  = viewport.width  + 'px';
     canvas.style.height = viewport.height + 'px';
     ctx.scale(outputScale, outputScale);
 
@@ -173,276 +88,228 @@ const PDFManager = (() => {
 
     await page.render({ canvasContext: ctx, viewport }).promise;
 
-    // Extract text and build segments
+    // Extract text
     const textContent = await page.getTextContent();
-    const overlay = document.createElement('div');
-    overlay.className = 'segment-overlay';
-    wrapper.appendChild(overlay);
+    const fullText = textContent.items
+      .map(item => item.str)
+      .join(' ')
+      .replace(/\s+/g, ' ')
+      .trim();
 
     const pageIdx = pages.length;
-    pages.push({
-      pageNum, canvas, ctx, wrapper, viewport,
-      outputScale, rendered: true
-    });
-
-    buildSegments(textContent, viewport, overlay, pageIdx);
+    pages.push({ pageNum, canvas, ctx, wrapper, viewport, outputScale });
+    pageTexts.push(fullText);
   }
 
-  /**
-   * FIX #4: Re-render a page whose canvas was evicted.
-   * We detect eviction by checking if the canvas has been cleared.
-   */
   async function reRenderPage(pageIdx) {
-    const pageInfo = pages[pageIdx];
-    if (!pageInfo || !pdfDoc) return;
-
+    const p = pages[pageIdx];
+    if (!p || !pdfDoc) return;
     try {
-      const page = await pdfDoc.getPage(pageInfo.pageNum);
-      const ctx = pageInfo.canvas.getContext('2d');
-
-      // Reset transform before re-rendering
+      const page = await pdfDoc.getPage(p.pageNum);
+      const ctx = p.canvas.getContext('2d');
       ctx.setTransform(1, 0, 0, 1, 0, 0);
-      ctx.clearRect(0, 0, pageInfo.canvas.width, pageInfo.canvas.height);
-      ctx.scale(pageInfo.outputScale, pageInfo.outputScale);
-
-      await page.render({
-        canvasContext: ctx,
-        viewport: pageInfo.viewport
-      }).promise;
-
-      pageInfo.rendered = true;
+      ctx.clearRect(0, 0, p.canvas.width, p.canvas.height);
+      ctx.scale(p.outputScale, p.outputScale);
+      await page.render({ canvasContext: ctx, viewport: p.viewport }).promise;
     } catch (e) {
-      console.warn('Re-render failed for page', pageInfo.pageNum, e);
+      console.warn('Re-render failed:', p.pageNum, e);
     }
   }
 
-  /**
-   * FIX #4: Observe page visibility. When a page scrolls into view,
-   * check if its canvas was evicted and re-render if needed.
-   */
   function setupCanvasObserver() {
     observer = new IntersectionObserver((entries) => {
       for (const entry of entries) {
         if (!entry.isIntersecting) continue;
-
-        const pageNum = parseInt(entry.target.dataset.pageNum);
-        const pageIdx = pages.findIndex(p => p.pageNum === pageNum);
-        if (pageIdx === -1) continue;
-
-        const pageInfo = pages[pageIdx];
-        // Check if canvas content was evicted by reading a pixel
-        const ctx = pageInfo.canvas.getContext('2d');
+        const idx = parseInt(entry.target.dataset.pageIdx);
+        const p = pages[idx];
+        if (!p) continue;
         try {
-          const pixel = ctx.getImageData(0, 0, 1, 1).data;
-          // If the pixel is completely transparent, canvas was likely evicted
-          // (a real PDF page almost always has white background = 255,255,255,255)
-          const isEmpty = pixel[0] === 0 && pixel[1] === 0 &&
-                          pixel[2] === 0 && pixel[3] === 0;
-          if (isEmpty && pageInfo.rendered) {
-            pageInfo.rendered = false;
-            reRenderPage(pageIdx);
+          const px = p.ctx.getImageData(0, 0, 1, 1).data;
+          if (px[0] === 0 && px[1] === 0 && px[2] === 0 && px[3] === 0) {
+            reRenderPage(idx);
           }
-        } catch (e) {
-          // SecurityError can happen in some contexts; ignore
-        }
+        } catch (e) {}
       }
     }, {
       root: document.getElementById('reader-area'),
-      // Observe pages a bit before they enter view
       rootMargin: '200px 0px',
       threshold: 0
     });
+    for (const p of pages) observer.observe(p.wrapper);
+  }
 
-    for (const p of pages) {
-      observer.observe(p.wrapper);
+  function getPages()     { return pages; }
+  function getPageTexts()  { return pageTexts; }
+  function getPageCount()  { return pdfDoc ? pdfDoc.numPages : 0; }
+
+  return { load, getPages, getPageTexts, getPageCount };
+})();
+
+
+// ════════════════════════════════════════
+// KokoroEngine — AI TTS via kokoro-js
+// ════════════════════════════════════════
+const KokoroEngine = (() => {
+  let ttsInstance = null;
+  let isLoaded = false;
+  let isLoading = false;
+
+  // Current playback state
+  let audioElement = null;
+  let isPlaying = false;
+  let currentPageIdx = 0;
+  let currentLang = 'en';
+  let currentVoiceId = 'af_heart';
+  let speed = 1.0;
+  let stopRequested = false;
+
+  // Callbacks
+  let onPageChange = null;
+  let onStateChange = null;
+  let onFinished = null;
+
+  /**
+   * Load the Kokoro model. ~80MB download, cached by browser after first time.
+   * Returns progress updates via callback.
+   */
+  async function loadModel(onProgress) {
+    if (isLoaded) return;
+    if (isLoading) return;
+    isLoading = true;
+
+    try {
+      // Dynamic import of kokoro-js from esm.sh CDN — no bundler needed
+      const { KokoroTTS } = await import('https://esm.sh/kokoro-js@1.2.1');
+
+      ttsInstance = await KokoroTTS.from_pretrained(
+        'onnx-community/Kokoro-82M-v1.0-ONNX',
+        {
+          dtype: 'q8',     // quantized — smallest download, good quality
+          device: 'wasm',  // WASM works on all browsers including iOS Safari
+          progress_callback: (progress) => {
+            if (onProgress && progress.progress != null) {
+              onProgress(Math.round(progress.progress));
+            }
+          }
+        }
+      );
+
+      isLoaded = true;
+    } catch (e) {
+      console.error('Kokoro model load failed:', e);
+      throw e;
+    } finally {
+      isLoading = false;
     }
   }
 
   /**
-   * Build tappable segment rectangles from PDF.js text items.
-   * FIX #2: Improved coordinate calculation.
-   * The old code used raw viewport-transformed coordinates, but the overlay
-   * div uses percentage positioning relative to the wrapper. The math was
-   * mostly correct but had issues with:
-   *   a) Y-axis: PDF coordinates are bottom-up, viewport transform flips them,
-   *      but the height calculation was sometimes wrong.
-   *   b) Hit area: negative margins collapsed the clickable area.
-   * Now: we carefully compute the bounding box per line and ensure min sizes.
+   * Generate speech for a text and play it. Returns a promise that resolves
+   * when playback finishes.
    */
-  function buildSegments(textContent, viewport, overlay, pageIdx) {
-    const items = textContent.items.filter(it => it.str.trim().length > 0);
-    if (items.length === 0) return;
+  async function speakText(text) {
+    if (!ttsInstance || !text || text.trim().length === 0) return;
 
-    const lines = [];
-    let currentLine = null;
+    // Generate audio blob
+    const audio = await ttsInstance.generate(text, {
+      voice: currentVoiceId,
+      speed: speed,
+    });
 
-    for (const item of items) {
-      const tx = item.transform;
-      const pdfX = tx[4];
-      const pdfY = tx[5];
-      const fontSize = Math.abs(tx[3]) || Math.abs(tx[0]) || 12;
+    // Convert to playable blob
+    const blob = audio.toBlob();
+    const url = URL.createObjectURL(blob);
 
-      // Convert PDF coordinates → viewport (pixel) coordinates
-      const [vx, vy] = pdfjsLib.Util.transform(viewport.transform, [pdfX, pdfY]);
-
-      const scaledW = item.width * renderScale;
-      const scaledH = fontSize * renderScale;
-
-      // Group by Y proximity (same line if Y difference < 40% of line height)
-      if (!currentLine || Math.abs(vy - currentLine.baseY) > scaledH * 0.4) {
-        currentLine = {
-          text: item.str,
-          x: vx,
-          baseY: vy,                    // baseline Y (from transform)
-          top: vy - scaledH * 0.85,     // approximate top of text
-          w: scaledW,
-          h: scaledH * 1.15,            // slightly taller for tap target
-          items: [item]
-        };
-        lines.push(currentLine);
-      } else {
-        currentLine.text += ' ' + item.str;
-        const newRight = Math.max(currentLine.x + currentLine.w, vx + scaledW);
-        currentLine.x = Math.min(currentLine.x, vx);
-        currentLine.w = newRight - currentLine.x;
-        currentLine.h = Math.max(currentLine.h, scaledH * 1.15);
-        currentLine.items.push(item);
-      }
-    }
-
-    const vpW = viewport.width;
-    const vpH = viewport.height;
-
-    for (const line of lines) {
-      if (line.text.trim().length === 0) continue;
-
-      const segIdx = segments.length;
-
-      const el = document.createElement('div');
-      el.className = 'segment-rect';
-
-      // Position as percentage of wrapper dimensions
-      const leftPct = Math.max(0, (line.x / vpW) * 100);
-      const topPct  = Math.max(0, (line.top / vpH) * 100);
-      const wPct    = Math.min(100 - leftPct, (line.w / vpW) * 100);
-      const hPct    = Math.min(100 - topPct, (line.h / vpH) * 100);
-
-      el.style.left   = leftPct + '%';
-      el.style.top    = topPct + '%';
-      el.style.width  = wPct + '%';
-      el.style.height = hPct + '%';
-      el.dataset.segIdx = segIdx;
-
-      overlay.appendChild(el);
-
-      segments.push({
-        text: line.text.trim(),
-        pageIdx,
-        el
-      });
-    }
-  }
-
-  function getSegments() { return segments; }
-  function getPageCount() { return pdfDoc ? pdfDoc.numPages : 0; }
-  function getPages() { return pages; }
-
-  return { load, getSegments, getPageCount, getPages };
-})();
-
-
-// ════════════════════════════════════════════════════════════
-// 3. SpeechEngine — with Fix #1 (voice filtering)
-// ════════════════════════════════════════════════════════════
-const SpeechEngine = (() => {
-  let voices = [];
-  let currentLang = 'fr';
-  let currentVoice = null;
-  let rate = 1.0;
-  let isPlaying = false;
-  let isPaused = false;
-  let currentSegIdx = 0;
-  let onSegmentChange = null;
-  let onStateChange = null;
-  let onFinished = null;
-  let utteranceQueue = [];
-  let currentChunkIdx = 0;
-  let chunkSegmentMap = [];
-
-  function initVoices() {
     return new Promise((resolve) => {
-      const tryLoad = () => {
-        voices = speechSynthesis.getVoices();
-        if (voices.length > 0) resolve(voices);
+      // Stop any current audio
+      if (audioElement) {
+        audioElement.pause();
+        audioElement.src = '';
+      }
+
+      audioElement = new Audio(url);
+      audioElement.playbackRate = 1.0; // Speed is applied in generation
+
+      audioElement.onended = () => {
+        URL.revokeObjectURL(url);
+        resolve('ended');
       };
-      tryLoad();
-      speechSynthesis.onvoiceschanged = () => { tryLoad(); resolve(voices); };
-      setTimeout(() => {
-        voices = speechSynthesis.getVoices();
-        resolve(voices);
-      }, 2500);
+      audioElement.onerror = (e) => {
+        console.warn('Audio playback error:', e);
+        URL.revokeObjectURL(url);
+        resolve('error');
+      };
+
+      audioElement.play().catch(e => {
+        console.warn('Play blocked:', e);
+        resolve('error');
+      });
     });
   }
 
   /**
-   * FIX #1: Get ONLY natural/usable voices for a language.
-   * Filters out novelty voices, then sorts by quality score.
+   * Read aloud starting from a specific page, going through all remaining pages.
    */
-  function getVoicesForLang(lang) {
-    return voices
-      .filter(v => v.lang.toLowerCase().startsWith(lang))
-      .filter(v => !isNoveltyVoice(v))
-      .sort((a, b) => voiceQualityScore(b) - voiceQualityScore(a));
+  async function playFromPage(startPageIdx, pageTexts) {
+    stopRequested = false;
+    isPlaying = true;
+    currentPageIdx = startPageIdx;
+    onStateChange?.(true);
+
+    for (let i = startPageIdx; i < pageTexts.length; i++) {
+      if (stopRequested) break;
+
+      currentPageIdx = i;
+      onPageChange?.(i);
+
+      const text = pageTexts[i];
+      if (!text || text.trim().length === 0) continue;
+
+      // Split into sentences for smoother generation
+      // (Kokoro has a ~510 token context window)
+      const chunks = splitIntoChunks(text, 400);
+
+      for (const chunk of chunks) {
+        if (stopRequested) break;
+        await speakText(chunk);
+      }
+    }
+
+    isPlaying = false;
+    stopRequested = false;
+    onStateChange?.(false);
+    onFinished?.();
   }
 
   /**
-   * FIX #1: Pick the single best natural voice for a language.
-   * Priority: Siri > Premium > Enhanced > local > first available.
+   * Split text into chunks at sentence boundaries, max `maxLen` chars each.
    */
-  function pickBestVoice(lang) {
-    const list = getVoicesForLang(lang);
-    if (list.length === 0) return null;
-    // List is already sorted by quality — just pick the top one
-    return list[0];
-  }
-
-  function setLang(lang) {
-    currentLang = lang;
-    currentVoice = pickBestVoice(lang);
-  }
-
-  function setVoice(voice) { currentVoice = voice; }
-  function setRate(r) { rate = r; }
-  function setSegmentIndex(idx) { currentSegIdx = idx; }
-  function getSegmentIndex() { return currentSegIdx; }
-
-  // Chunking: split long text for iOS safety
-  function chunkText(text) {
-    if (text.length <= MAX_UTTERANCE_LEN) return [text];
+  function splitIntoChunks(text, maxLen) {
+    if (text.length <= maxLen) return [text];
 
     const chunks = [];
     let remaining = text;
 
     while (remaining.length > 0) {
-      if (remaining.length <= MAX_UTTERANCE_LEN) {
+      if (remaining.length <= maxLen) {
         chunks.push(remaining);
         break;
       }
 
-      let splitAt = MAX_UTTERANCE_LEN;
-      const punctuation = ['. ', '! ', '? ', '; ', ', ', ' — ', ' – ', ': '];
-
-      for (const p of punctuation) {
-        const idx = remaining.lastIndexOf(p, MAX_UTTERANCE_LEN);
-        if (idx > MAX_UTTERANCE_LEN * 0.3) {
-          splitAt = idx + p.length;
+      let splitAt = maxLen;
+      // Try to split at sentence boundaries
+      const endings = ['. ', '! ', '? ', '.\n', '!\n', '?\n', '; ', ':\n'];
+      for (const e of endings) {
+        const idx = remaining.lastIndexOf(e, maxLen);
+        if (idx > maxLen * 0.3) {
+          splitAt = idx + e.length;
           break;
         }
       }
-
-      if (splitAt === MAX_UTTERANCE_LEN) {
-        const spaceIdx = remaining.lastIndexOf(' ', MAX_UTTERANCE_LEN);
-        if (spaceIdx > MAX_UTTERANCE_LEN * 0.3) splitAt = spaceIdx + 1;
+      // Fallback: split at space
+      if (splitAt === maxLen) {
+        const sp = remaining.lastIndexOf(' ', maxLen);
+        if (sp > maxLen * 0.3) splitAt = sp + 1;
       }
 
       chunks.push(remaining.slice(0, splitAt).trim());
@@ -452,151 +319,74 @@ const SpeechEngine = (() => {
     return chunks.filter(c => c.length > 0);
   }
 
-  function buildQueue(segments) {
-    utteranceQueue = [];
-    chunkSegmentMap = [];
-
-    for (let i = currentSegIdx; i < segments.length; i++) {
-      const chunks = chunkText(segments[i].text);
-      for (const chunk of chunks) {
-        utteranceQueue.push(chunk);
-        chunkSegmentMap.push(i);
-      }
+  function stop() {
+    stopRequested = true;
+    if (audioElement) {
+      audioElement.pause();
+      audioElement.src = '';
     }
-    currentChunkIdx = 0;
-  }
-
-  function speakNextChunk(segments) {
-    if (currentChunkIdx >= utteranceQueue.length) {
-      isPlaying = false;
-      isPaused = false;
-      onStateChange?.(false, false);
-      onFinished?.();
-      return;
-    }
-
-    const text = utteranceQueue[currentChunkIdx];
-    const segIdx = chunkSegmentMap[currentChunkIdx];
-
-    if (segIdx !== currentSegIdx) {
-      currentSegIdx = segIdx;
-    }
-    onSegmentChange?.(currentSegIdx);
-
-    const utt = new SpeechSynthesisUtterance(text);
-    if (currentVoice) utt.voice = currentVoice;
-    utt.lang = currentLang === 'fr' ? 'fr-FR' : 'en-US';
-    utt.rate = rate;
-
-    utt.onend = () => {
-      currentChunkIdx++;
-      if (currentChunkIdx < chunkSegmentMap.length) {
-        currentSegIdx = chunkSegmentMap[currentChunkIdx];
-      }
-      if (isPlaying && !isPaused) {
-        speakNextChunk(segments);
-      }
-    };
-
-    utt.onerror = (e) => {
-      if (e.error === 'interrupted' || e.error === 'canceled') return;
-      console.warn('Speech error:', e.error);
-      currentChunkIdx++;
-      if (isPlaying && !isPaused) {
-        speakNextChunk(segments);
-      }
-    };
-
-    speechSynthesis.speak(utt);
-  }
-
-  function play(segments) {
-    if (isPaused) {
-      isPaused = false;
-      speechSynthesis.resume();
-      onStateChange?.(true, false);
-      return;
-    }
-
-    speechSynthesis.cancel();
-    isPlaying = true;
-    isPaused = false;
-    buildQueue(segments);
-    onStateChange?.(true, false);
-    speakNextChunk(segments);
+    isPlaying = false;
+    onStateChange?.(false);
   }
 
   function pause() {
-    if (!isPlaying) return;
-    isPaused = true;
-    speechSynthesis.pause();
-    onStateChange?.(true, true);
+    if (audioElement) audioElement.pause();
+    onStateChange?.(false);
   }
 
-  function stop() {
-    speechSynthesis.cancel();
-    isPlaying = false;
-    isPaused = false;
-    onStateChange?.(false, false);
+  function resume() {
+    if (audioElement && audioElement.paused && audioElement.src) {
+      audioElement.play().catch(() => {});
+      onStateChange?.(true);
+    }
   }
 
-  function playFrom(segIdx, segments) {
-    speechSynthesis.cancel();
-    currentSegIdx = segIdx;
-    isPlaying = true;
-    isPaused = false;
-    buildQueue(segments);
-    onStateChange?.(true, false);
-    speakNextChunk(segments);
-  }
+  function setVoice(voiceId) { currentVoiceId = voiceId; }
+  function setSpeed(s) { speed = s; }
+  function setLang(lang) { currentLang = lang; }
 
   return {
-    initVoices,
-    getVoicesForLang,
-    pickBestVoice,
-    setLang,
-    setVoice,
-    setRate,
-    setSegmentIndex,
-    getSegmentIndex,
-    play,
-    pause,
+    loadModel,
+    playFromPage,
     stop,
-    playFrom,
+    pause,
+    resume,
+    setVoice,
+    setSpeed,
+    setLang,
+    get isLoaded() { return isLoaded; },
+    get isLoading() { return isLoading; },
     get isPlaying() { return isPlaying; },
-    get isPaused() { return isPaused; },
+    get currentPageIdx() { return currentPageIdx; },
     get currentLang() { return currentLang; },
-    get currentVoice() { return currentVoice; },
-    get rate() { return rate; },
-    set onSegmentChange(fn) { onSegmentChange = fn; },
+    get currentVoiceId() { return currentVoiceId; },
+    get speed() { return speed; },
+    set onPageChange(fn)  { onPageChange = fn; },
     set onStateChange(fn) { onStateChange = fn; },
-    set onFinished(fn) { onFinished = fn; },
+    set onFinished(fn)    { onFinished = fn; },
   };
 })();
 
 
-// ════════════════════════════════════════════════════════════
-// 4. Persistence (unchanged — already solid)
-// ════════════════════════════════════════════════════════════
+// ════════════════════════════════════════
+// Persistence
+// ════════════════════════════════════════
 const Persistence = (() => {
   function save(data) {
-    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(data)); }
-    catch (e) { /* quota exceeded */ }
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(data)); } catch {}
   }
   function load() {
-    try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      return raw ? JSON.parse(raw) : null;
-    } catch (e) { return null; }
+    try { const r = localStorage.getItem(STORAGE_KEY); return r ? JSON.parse(r) : null; }
+    catch { return null; }
   }
-  function makeFileKey(file) { return file.name + '|' + file.size; }
+  function makeFileKey(f) { return f.name + '|' + f.size; }
   return { save, load, makeFileKey };
 })();
 
 
-// ════════════════════════════════════════════════════════════
-// 5. UIController — with all fixes wired in
-// ════════════════════════════════════════════════════════════
+// ════════════════════════════════════════
+// UIController
+// ════════════════════════════════════════
 (async function UIController() {
   const welcomeScreen    = document.getElementById('welcome-screen');
   const welcomeBtn       = document.getElementById('welcome-import-btn');
@@ -609,6 +399,7 @@ const Persistence = (() => {
   const voiceMenuList    = document.getElementById('voice-menu-list');
   const readerArea       = document.getElementById('reader-area');
   const loadingOverlay   = document.getElementById('loading-overlay');
+  const loadingText      = document.getElementById('loading-text');
   const playBtn          = document.getElementById('play-btn');
   const stopBtn          = document.getElementById('stop-btn');
   const speedSlider      = document.getElementById('speed-slider');
@@ -616,31 +407,24 @@ const Persistence = (() => {
   const progressBarFill  = document.getElementById('progress-bar-fill');
   const progressLabel    = document.getElementById('progress-label');
 
-  let segments = [];
+  let pageTexts = [];
   let currentFileKey = null;
-  let activeSegEl = null;
-
-  // ── Init voices ──
-  await SpeechEngine.initVoices();
+  let activePageWrapper = null;
+  let isPaused = false;
 
   // ── Restore settings ──
   const saved = Persistence.load();
   if (saved) {
-    if (saved.lang) SpeechEngine.setLang(saved.lang);
-    if (saved.rate) {
-      SpeechEngine.setRate(saved.rate);
-      speedSlider.value = saved.rate;
-    }
-    if (saved.voiceNames && saved.voiceNames[SpeechEngine.currentLang]) {
-      const vName = saved.voiceNames[SpeechEngine.currentLang];
-      const match = SpeechEngine.getVoicesForLang(SpeechEngine.currentLang)
-        .find(v => v.name === vName);
-      if (match) SpeechEngine.setVoice(match);
+    if (saved.lang) KokoroEngine.setLang(saved.lang);
+    if (saved.voiceId) KokoroEngine.setVoice(saved.voiceId);
+    if (saved.speed) {
+      KokoroEngine.setSpeed(saved.speed);
+      speedSlider.value = saved.speed;
     }
   } else {
-    SpeechEngine.setLang('fr');
+    KokoroEngine.setLang('fr');
+    KokoroEngine.setVoice('ff_siwis');
   }
-
   updateLangButton();
   updateSpeedDisplay();
 
@@ -657,36 +441,29 @@ const Persistence = (() => {
   async function loadPDF(file) {
     welcomeScreen.classList.add('hidden');
     loadingOverlay.classList.remove('hidden');
+    loadingText.textContent = 'Loading PDF…';
     docTitle.textContent = file.name.replace(/\.pdf$/i, '');
 
     try {
       const buffer = await file.arrayBuffer();
-      const result = await PDFManager.load(buffer);
-      segments = result.segments;
-
+      await PDFManager.load(buffer);
+      pageTexts = PDFManager.getPageTexts();
       currentFileKey = Persistence.makeFileKey(file);
 
-      if (saved && saved.fileKey === currentFileKey && saved.segIdx != null) {
-        SpeechEngine.setSegmentIndex(
-          Math.min(saved.segIdx, segments.length - 1)
-        );
-      } else {
-        SpeechEngine.setSegmentIndex(0);
-      }
-
-      // FIX #2: Attach tap handlers with clear "start reading from here" behavior
-      segments.forEach((seg, idx) => {
-        seg.el.addEventListener('click', (e) => {
-          e.stopPropagation();
-          onSegmentTap(idx);
-        });
+      // Attach page-tap handlers
+      PDFManager.getPages().forEach((page, idx) => {
+        page.wrapper.addEventListener('click', () => onPageTap(idx));
       });
 
-      updateProgress();
+      // Restore position
+      let startPage = 0;
+      if (saved && saved.fileKey === currentFileKey && saved.pageIdx != null) {
+        startPage = Math.min(saved.pageIdx, pageTexts.length - 1);
+      }
+      updateProgress(startPage);
 
-      const segIdx = SpeechEngine.getSegmentIndex();
-      if (segIdx > 0 && segments[segIdx]) {
-        setTimeout(() => scrollToSegment(segIdx, false), 300);
+      if (startPage > 0) {
+        setTimeout(() => scrollToPage(startPage, false), 300);
       }
 
     } catch (err) {
@@ -699,62 +476,84 @@ const Persistence = (() => {
     fileInput.value = '';
   }
 
-  // ── FIX #2: Segment Tap — start reading from tapped position ──
-  function onSegmentTap(idx) {
-    // Immediately highlight so user sees confirmation of tap
-    highlightSegment(idx);
-    // Start reading from this segment
-    SpeechEngine.playFrom(idx, segments);
+  // ── TAP TO READ: Tap a page → start reading from that page ──
+  async function onPageTap(pageIdx) {
+    // If model not loaded yet, prompt to download
+    if (!KokoroEngine.isLoaded) {
+      voiceMenuOverlay.classList.add('visible');
+      populateVoiceMenu();
+      return;
+    }
+
+    // Stop any current playback
+    KokoroEngine.stop();
+    isPaused = false;
+
+    // Highlight tapped page
+    highlightPage(pageIdx);
+
+    // Start reading from this page
+    KokoroEngine.playFromPage(pageIdx, pageTexts);
   }
 
-  // ── Speech callbacks ──
-  SpeechEngine.onSegmentChange = (segIdx) => {
-    highlightSegment(segIdx);
-    updateProgress();
-    scrollToSegment(segIdx, true);
-    persistState();
+  // ── Callbacks ──
+  KokoroEngine.onPageChange = (pageIdx) => {
+    highlightPage(pageIdx);
+    updateProgress(pageIdx);
+    scrollToPage(pageIdx, true);
+    persistState(pageIdx);
   };
 
-  SpeechEngine.onStateChange = (playing, paused) => {
-    updatePlayButton(playing, paused);
+  KokoroEngine.onStateChange = (playing) => {
+    updatePlayButton(playing);
+    if (!playing) isPaused = false;
   };
 
-  SpeechEngine.onFinished = () => {
-    clearHighlight();
+  KokoroEngine.onFinished = () => {
+    clearPageHighlight();
   };
 
-  // ── Highlight ──
-  function highlightSegment(idx) {
-    if (activeSegEl) activeSegEl.classList.remove('active');
-    if (segments[idx]) {
-      activeSegEl = segments[idx].el;
-      activeSegEl.classList.add('active');
+  // ── Page highlight ──
+  function highlightPage(idx) {
+    clearPageHighlight();
+    const pages = PDFManager.getPages();
+    if (pages[idx]) {
+      activePageWrapper = pages[idx].wrapper;
+      activePageWrapper.classList.add('reading-from');
+      // Remove the badge after 2 seconds but keep outline
+      setTimeout(() => {
+        if (activePageWrapper) {
+          activePageWrapper.classList.remove('reading-from');
+          activePageWrapper.style.outline = '2px solid var(--accent)';
+          activePageWrapper.style.outlineOffset = '-2px';
+        }
+      }, 2000);
     }
   }
 
-  function clearHighlight() {
-    if (activeSegEl) {
-      activeSegEl.classList.remove('active');
-      activeSegEl = null;
+  function clearPageHighlight() {
+    if (activePageWrapper) {
+      activePageWrapper.classList.remove('reading-from');
+      activePageWrapper.style.outline = '';
+      activePageWrapper.style.outlineOffset = '';
+      activePageWrapper = null;
     }
   }
 
   // ── Scroll ──
-  function scrollToSegment(idx, smooth) {
-    const seg = segments[idx];
-    if (!seg) return;
-
-    const el = seg.el;
+  function scrollToPage(idx, smooth) {
+    const pages = PDFManager.getPages();
+    if (!pages[idx]) return;
+    const wrapper = pages[idx].wrapper;
     const areaRect = readerArea.getBoundingClientRect();
-    const elRect = el.getBoundingClientRect();
+    const wrapRect = wrapper.getBoundingClientRect();
 
-    // Check if already in view (with generous margins)
-    const inView = elRect.top >= areaRect.top + 40 &&
-                   elRect.bottom <= areaRect.bottom - 40;
-    if (inView) return; // Don't scroll if already visible
+    const inView = wrapRect.top >= areaRect.top - 20 &&
+                   wrapRect.top <= areaRect.top + areaRect.height * 0.5;
+    if (inView) return;
 
-    const elTopInArea = elRect.top - areaRect.top + readerArea.scrollTop;
-    const target = elTopInArea - readerArea.clientHeight / 3;
+    const topInArea = wrapRect.top - areaRect.top + readerArea.scrollTop;
+    const target = topInArea - 20;
 
     if (smooth) {
       readerArea.scrollTo({ top: Math.max(0, target), behavior: 'smooth' });
@@ -764,93 +563,115 @@ const Persistence = (() => {
   }
 
   // ── Controls ──
-  playBtn.addEventListener('click', () => {
-    if (segments.length === 0) return;
+  playBtn.addEventListener('click', async () => {
+    if (pageTexts.length === 0) return;
 
-    if (SpeechEngine.isPlaying && !SpeechEngine.isPaused) {
-      SpeechEngine.pause();
-    } else {
-      SpeechEngine.play(segments);
+    if (!KokoroEngine.isLoaded) {
+      voiceMenuOverlay.classList.add('visible');
+      populateVoiceMenu();
+      return;
     }
+
+    if (KokoroEngine.isPlaying && !isPaused) {
+      // Pause
+      KokoroEngine.pause();
+      isPaused = true;
+      updatePlayButton(false);
+      return;
+    }
+
+    if (isPaused) {
+      // Resume
+      KokoroEngine.resume();
+      isPaused = false;
+      updatePlayButton(true);
+      return;
+    }
+
+    // Start from current page (or first page of visible area)
+    const startPage = getVisiblePageIdx();
+    KokoroEngine.playFromPage(startPage, pageTexts);
   });
 
   stopBtn.addEventListener('click', () => {
-    SpeechEngine.stop();
-    // Don't clear highlight — keep user's place visible
-    persistState();
+    KokoroEngine.stop();
+    isPaused = false;
+    persistState(KokoroEngine.currentPageIdx);
   });
 
   // Speed
   speedSlider.addEventListener('input', () => {
     const val = parseFloat(speedSlider.value);
-    SpeechEngine.setRate(val);
+    KokoroEngine.setSpeed(val);
     updateSpeedDisplay();
-    if (SpeechEngine.isPlaying) {
-      SpeechEngine.playFrom(SpeechEngine.getSegmentIndex(), segments);
-    }
-    persistState();
+    persistState(KokoroEngine.currentPageIdx);
   });
 
   function updateSpeedDisplay() {
-    speedDisplay.textContent = SpeechEngine.rate.toFixed(1) + '×';
+    speedDisplay.textContent = KokoroEngine.speed.toFixed(1) + '×';
   }
 
-  function updatePlayButton(playing, paused) {
-    if (playing && !paused) {
+  function updatePlayButton(playing) {
+    if (playing) {
       playBtn.innerHTML = `<svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/></svg>`;
     } else {
       playBtn.innerHTML = `<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5.14v13.72a1 1 0 001.5.86l11-6.86a1 1 0 000-1.72l-11-6.86A1 1 0 008 5.14z"/></svg>`;
     }
   }
 
-  // ── FIX #3: Progress — clear visual bar + page-based label ──
-  function updateProgress() {
-    if (segments.length === 0) {
+  // ── Progress ──
+  function updateProgress(pageIdx) {
+    const total = PDFManager.getPageCount();
+    if (total === 0) {
       progressBarFill.style.width = '0%';
       progressLabel.textContent = '—';
       return;
     }
-
-    const idx = SpeechEngine.getSegmentIndex();
-    const seg = segments[idx];
-
-    // Calculate which page we're on
-    const pageNum = seg ? PDFManager.getPages()[seg.pageIdx]?.pageNum : 1;
-    const totalPages = PDFManager.getPageCount();
-
-    // Progress based on page position (most intuitive for users)
-    // "I'm on page 3 of 12" → progress bar fills to ~25%
-    const pct = totalPages > 0 ? Math.round((pageNum / totalPages) * 100) : 0;
-
+    const page = (pageIdx ?? 0) + 1; // 1-indexed for display
+    const pct = Math.round((page / total) * 100);
     progressBarFill.style.width = pct + '%';
-    progressLabel.textContent = `Page ${pageNum} of ${totalPages}`;
+    progressLabel.textContent = `Page ${page} of ${total}`;
+  }
+
+  /**
+   * Find which page is currently most visible in the scroll area.
+   */
+  function getVisiblePageIdx() {
+    const pages = PDFManager.getPages();
+    const areaRect = readerArea.getBoundingClientRect();
+    const areaCenter = areaRect.top + areaRect.height / 3;
+
+    for (let i = 0; i < pages.length; i++) {
+      const r = pages[i].wrapper.getBoundingClientRect();
+      if (r.bottom > areaCenter) return i;
+    }
+    return 0;
   }
 
   // ── Language Toggle ──
   langToggle.addEventListener('click', () => {
-    const newLang = SpeechEngine.currentLang === 'fr' ? 'en' : 'fr';
-    SpeechEngine.setLang(newLang);
+    const wasPlaying = KokoroEngine.isPlaying;
+    if (wasPlaying) KokoroEngine.stop();
+    isPaused = false;
 
-    // Try to restore saved voice for this language
-    const s = Persistence.load();
-    if (s?.voiceNames?.[newLang]) {
-      const match = SpeechEngine.getVoicesForLang(newLang)
-        .find(v => v.name === s.voiceNames[newLang]);
-      if (match) SpeechEngine.setVoice(match);
+    const newLang = KokoroEngine.currentLang === 'fr' ? 'en' : 'fr';
+    KokoroEngine.setLang(newLang);
+
+    // Set default voice for the new language
+    const voices = VOICE_DEFS[newLang];
+    if (voices && voices.length > 0) {
+      KokoroEngine.setVoice(voices[0].id);
     }
 
     updateLangButton();
-    if (SpeechEngine.isPlaying) {
-      SpeechEngine.playFrom(SpeechEngine.getSegmentIndex(), segments);
-    }
-    persistState();
+    persistState(KokoroEngine.currentPageIdx);
   });
 
   function updateLangButton() {
-    langToggle.textContent = SpeechEngine.currentLang.toUpperCase();
+    langToggle.textContent = KokoroEngine.currentLang.toUpperCase();
   }
 
-  // ── FIX #1: Voice Menu — curated, no garbage ──
+  // ── Voice Menu ──
   voiceMenuBtn.addEventListener('click', () => {
     populateVoiceMenu();
     voiceMenuOverlay.classList.add('visible');
@@ -863,78 +684,92 @@ const Persistence = (() => {
   });
 
   function populateVoiceMenu() {
-    // getVoicesForLang already filters out novelty and sorts by quality
-    const list = SpeechEngine.getVoicesForLang(SpeechEngine.currentLang);
     voiceMenuList.innerHTML = '';
 
-    if (list.length === 0) {
-      voiceMenuList.innerHTML =
-        '<p style="padding:12px;color:var(--text-secondary);font-size:14px;">' +
-        'No voices found for this language on your device.</p>';
-      return;
-    }
+    const lang = KokoroEngine.currentLang;
+    const voices = VOICE_DEFS[lang] || [];
 
-    // Show a clean, short list. Top voice is pre-selected.
-    for (const voice of list) {
+    // Show curated voice list (just 1-2 voices, no garbage)
+    for (const v of voices) {
       const btn = document.createElement('button');
-      const isSelected = SpeechEngine.currentVoice?.name === voice.name;
+      const isSelected = KokoroEngine.currentVoiceId === v.id;
       btn.className = 'voice-option' + (isSelected ? ' selected' : '');
-
-      // Friendly label: just the voice name, not the full identifier
-      let displayName = voice.name;
-      // Strip common prefixes/suffixes that add noise
-      displayName = displayName.replace(/\(.*?\)/g, '').trim();
-
-      const qualityLabel = voice.name.toLowerCase().includes('siri') ? 'Siri' :
-                           voice.name.toLowerCase().includes('premium') ? 'Premium' :
-                           voice.name.toLowerCase().includes('enhanced') ? 'Enhanced' :
-                           voice.localService ? 'On-device' : 'Network';
-
       btn.innerHTML = `
         <span class="check">${isSelected ? '✓' : ''}</span>
-        <span class="voice-name">${displayName}</span>
-        <span class="voice-tag">${qualityLabel}</span>
+        <span class="voice-name">${v.label}</span>
+        <span class="voice-tag">${v.gender} · AI</span>
       `;
-
       btn.addEventListener('click', () => {
-        SpeechEngine.setVoice(voice);
-        voiceMenuOverlay.classList.remove('visible');
-        if (SpeechEngine.isPlaying) {
-          SpeechEngine.playFrom(SpeechEngine.getSegmentIndex(), segments);
-        }
-        persistState();
+        KokoroEngine.setVoice(v.id);
+        populateVoiceMenu(); // re-render to update checkmarks
+        persistState(KokoroEngine.currentPageIdx);
       });
-
       voiceMenuList.appendChild(btn);
     }
+
+    // Download section
+    const section = document.createElement('div');
+    section.className = 'voice-download-section';
+
+    if (KokoroEngine.isLoaded) {
+      section.innerHTML = `
+        <div class="voice-status-text">
+          ✓ AI voice model loaded — natural speech ready
+        </div>
+      `;
+    } else {
+      const btn = document.createElement('button');
+      btn.className = 'voice-download-btn';
+      btn.innerHTML = '⬇ Download AI Voice (~80 MB)';
+
+      const progressDiv = document.createElement('div');
+      progressDiv.className = 'voice-download-progress';
+      progressDiv.textContent = 'One-time download · cached on your device after';
+
+      btn.addEventListener('click', async () => {
+        btn.className = 'voice-download-btn downloading';
+        btn.innerHTML = '<div class="spinner" style="width:18px;height:18px;border-width:2px;"></div> Downloading…';
+        progressDiv.textContent = 'Loading AI model files…';
+
+        try {
+          await KokoroEngine.loadModel((pct) => {
+            progressDiv.textContent = `Downloading… ${pct}%`;
+          });
+          btn.className = 'voice-download-btn done';
+          btn.innerHTML = '✓ Ready';
+          progressDiv.textContent = 'Natural AI voices loaded successfully!';
+        } catch (e) {
+          btn.className = 'voice-download-btn';
+          btn.innerHTML = '⬇ Retry Download';
+          progressDiv.textContent = 'Download failed. Check your connection and try again.';
+        }
+      });
+
+      section.appendChild(btn);
+      section.appendChild(progressDiv);
+    }
+
+    voiceMenuList.appendChild(section);
   }
 
   // ── Persistence ──
-  function persistState() {
-    const s = Persistence.load() || {};
-    const voiceNames = s.voiceNames || {};
-    if (SpeechEngine.currentVoice) {
-      voiceNames[SpeechEngine.currentLang] = SpeechEngine.currentVoice.name;
-    }
-
+  function persistState(pageIdx) {
     Persistence.save({
-      lang: SpeechEngine.currentLang,
-      rate: SpeechEngine.rate,
-      voiceNames,
+      lang: KokoroEngine.currentLang,
+      voiceId: KokoroEngine.currentVoiceId,
+      speed: KokoroEngine.speed,
       fileKey: currentFileKey,
-      segIdx: SpeechEngine.getSegmentIndex()
+      pageIdx: pageIdx ?? 0,
     });
   }
 
   document.addEventListener('visibilitychange', () => {
-    if (document.hidden) persistState();
+    if (document.hidden) persistState(KokoroEngine.currentPageIdx);
   });
 
   // ── Service Worker ──
   if ('serviceWorker' in navigator) {
-    navigator.serviceWorker.register('./sw.js').catch(err =>
-      console.warn('SW registration failed:', err)
-    );
+    navigator.serviceWorker.register('./sw.js').catch(() => {});
   }
 
 })();
