@@ -1,4 +1,4 @@
-/* Liseuse v3 — styles.css */
+/* Liseuse v4 — styles.css */
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
 :root {
@@ -9,8 +9,6 @@
   --text-secondary: #86868b;
   --accent: #c45d3e;
   --accent-light: rgba(196,93,62,0.12);
-  --highlight: rgba(255,214,102,0.42);
-  --highlight-border: rgba(255,190,50,0.55);
   --bar-bg: rgba(255,255,255,0.92);
   --bar-border: rgba(0,0,0,0.06);
   --control-bg: #f5f5f7;
@@ -26,17 +24,12 @@
 
 html { -webkit-text-size-adjust: 100%; -webkit-tap-highlight-color: transparent; }
 body {
-  font-family: var(--font-ui);
-  background: var(--bg);
-  color: var(--text);
-  overflow: hidden;
-  height: 100vh; height: 100dvh;
-  position: relative;
+  font-family: var(--font-ui); background: var(--bg); color: var(--text);
+  overflow: hidden; height: 100vh; height: 100dvh; position: relative;
 }
 button {
-  font-family: var(--font-ui);
-  border: none; background: none; cursor: pointer; color: inherit;
-  -webkit-tap-highlight-color: transparent;
+  font-family: var(--font-ui); border: none; background: none;
+  cursor: pointer; color: inherit; -webkit-tap-highlight-color: transparent;
 }
 
 /* ── Welcome ── */
@@ -56,12 +49,9 @@ button {
 .welcome-title { font-family: var(--font-body); font-size: 26px; font-weight: 600; margin-bottom: 8px; }
 .welcome-sub { font-size: 15px; color: var(--text-secondary); margin-bottom: 32px; text-align: center; line-height: 1.5; padding: 0 40px; }
 .welcome-btn {
-  display: flex; align-items: center; gap: 8px;
-  padding: 14px 28px; border-radius: 14px;
-  background: var(--accent); color: white;
-  font-size: 16px; font-weight: 600;
-  box-shadow: 0 2px 12px rgba(196,93,62,0.3);
-  transition: transform 0.15s;
+  display: flex; align-items: center; gap: 8px; padding: 14px 28px; border-radius: 14px;
+  background: var(--accent); color: white; font-size: 16px; font-weight: 600;
+  box-shadow: 0 2px 12px rgba(196,93,62,0.3); transition: transform 0.15s;
 }
 .welcome-btn:active { transform: scale(0.96); }
 .welcome-btn svg { width: 20px; height: 20px; }
@@ -69,15 +59,11 @@ button {
 /* ── Top Bar ── */
 #top-bar {
   position: fixed; top: 0; left: 0; right: 0;
-  height: calc(var(--top-bar-h) + var(--safe-top));
-  padding-top: var(--safe-top);
+  height: calc(var(--top-bar-h) + var(--safe-top)); padding-top: var(--safe-top);
   background: var(--bar-bg);
-  backdrop-filter: saturate(180%) blur(20px);
-  -webkit-backdrop-filter: saturate(180%) blur(20px);
+  backdrop-filter: saturate(180%) blur(20px); -webkit-backdrop-filter: saturate(180%) blur(20px);
   border-bottom: 0.5px solid var(--bar-border);
-  display: flex; align-items: center;
-  padding-left: 12px; padding-right: 12px;
-  z-index: 50;
+  display: flex; align-items: center; padding-left: 12px; padding-right: 12px; z-index: 50;
 }
 .bar-btn {
   width: 36px; height: 36px; border-radius: 10px;
@@ -90,10 +76,8 @@ button {
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding: 0 8px;
 }
 #lang-toggle {
-  padding: 5px 10px; border-radius: 8px;
-  font-size: 13px; font-weight: 700;
-  color: var(--accent); background: var(--accent-light);
-  letter-spacing: 0.04em; flex-shrink: 0;
+  padding: 5px 10px; border-radius: 8px; font-size: 13px; font-weight: 700;
+  color: var(--accent); background: var(--accent-light); letter-spacing: 0.04em; flex-shrink: 0;
 }
 #lang-toggle:active { transform: scale(0.93); }
 
@@ -104,78 +88,68 @@ button {
   bottom: calc(var(--bottom-bar-h) + var(--safe-bottom));
   left: 0; right: 0;
   overflow-y: auto; overflow-x: hidden;
-  -webkit-overflow-scrolling: touch;
-  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch; overscroll-behavior: contain;
   background: var(--bg);
 }
 
 .page-wrapper {
-  position: relative;
-  margin: 16px auto;
-  background: var(--paper);
-  border-radius: 4px;
+  position: relative; margin: 16px auto;
+  background: var(--paper); border-radius: 4px;
   box-shadow: 0 1px 8px var(--paper-shadow), 0 0 1px rgba(0,0,0,0.04);
-  overflow: hidden;
-  contain: layout style paint;
-  /* Page is tappable to start reading */
-  cursor: pointer;
+  overflow: hidden; cursor: pointer;
+  /* Placeholder background while canvas hasn't loaded yet */
+  min-height: 100px;
 }
 .page-wrapper canvas { display: block; width: 100%; height: auto; }
 
-/* Page-level tap highlight — when user taps a page to read from there */
+/* Currently reading page — clean subtle outline */
 .page-wrapper.reading-from {
   outline: 3px solid var(--accent);
   outline-offset: -3px;
-  border-radius: 4px;
 }
-.page-wrapper.reading-from::after {
-  content: '▶ Reading from here';
-  position: absolute; top: 8px; right: 8px;
-  background: var(--accent); color: white;
-  font-size: 11px; font-weight: 600;
-  padding: 4px 10px; border-radius: 6px;
-  pointer-events: none;
-  animation: fadeInBadge 0.3s ease;
-}
-@keyframes fadeInBadge { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
 
 /* ── Bottom Bar ── */
 #bottom-bar {
   position: fixed; bottom: 0; left: 0; right: 0;
-  height: calc(var(--bottom-bar-h) + var(--safe-bottom));
-  padding-bottom: var(--safe-bottom);
+  height: calc(var(--bottom-bar-h) + var(--safe-bottom)); padding-bottom: var(--safe-bottom);
   background: var(--bar-bg);
-  backdrop-filter: saturate(180%) blur(20px);
-  -webkit-backdrop-filter: saturate(180%) blur(20px);
+  backdrop-filter: saturate(180%) blur(20px); -webkit-backdrop-filter: saturate(180%) blur(20px);
   border-top: 0.5px solid var(--bar-border);
-  display: flex; align-items: center;
-  padding-left: 14px; padding-right: 14px; gap: 8px;
-  z-index: 50;
+  display: flex; align-items: center; padding-left: 14px; padding-right: 14px; gap: 8px; z-index: 50;
 }
 .player-btn {
   width: 44px; height: 44px; border-radius: 50%;
   display: flex; align-items: center; justify-content: center; flex-shrink: 0;
-  transition: transform 0.12s;
+  transition: transform 0.12s, background 0.15s;
 }
 .player-btn:active { transform: scale(0.9); }
 .player-btn svg { width: 22px; height: 22px; }
 #play-btn { background: var(--accent); color: white; box-shadow: 0 2px 8px rgba(196,93,62,0.25); }
 #stop-btn { background: var(--control-bg); color: var(--text-secondary); }
+
+/* Spinner inside play button when generating */
+.btn-spinner {
+  width: 20px; height: 20px;
+  border: 2.5px solid rgba(0,0,0,0.15);
+  border-top-color: var(--text-secondary);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}
+
 .speed-control { display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
 #speed-display {
   font-size: 12px; font-weight: 700; color: var(--text-secondary);
   min-width: 32px; text-align: center; font-variant-numeric: tabular-nums;
 }
 #speed-slider {
-  width: 52px; height: 4px;
-  -webkit-appearance: none; appearance: none;
+  width: 52px; height: 4px; -webkit-appearance: none; appearance: none;
   background: var(--control-bg); border-radius: 2px; outline: none;
 }
 #speed-slider::-webkit-slider-thumb {
   -webkit-appearance: none; width: 18px; height: 18px; border-radius: 50%;
-  background: white; border: 1px solid rgba(0,0,0,0.1);
-  box-shadow: 0 1px 4px rgba(0,0,0,0.12);
+  background: white; border: 1px solid rgba(0,0,0,0.1); box-shadow: 0 1px 4px rgba(0,0,0,0.12);
 }
+
 .progress-area { flex: 1; display: flex; flex-direction: column; align-items: flex-end; gap: 3px; min-width: 0; }
 .progress-bar-track { width: 100%; max-width: 100px; height: 4px; background: var(--control-bg); border-radius: 2px; overflow: hidden; }
 .progress-bar-fill { height: 100%; width: 0%; background: var(--accent); border-radius: 2px; transition: width 0.3s ease; }
@@ -183,8 +157,8 @@ button {
 
 /* ── Voice Menu ── */
 #voice-menu-overlay {
-  position: fixed; inset: 0; background: var(--overlay-bg);
-  z-index: 100; display: flex; align-items: flex-end; justify-content: center;
+  position: fixed; inset: 0; background: var(--overlay-bg); z-index: 100;
+  display: flex; align-items: flex-end; justify-content: center;
   opacity: 0; visibility: hidden; transition: opacity 0.25s, visibility 0.25s;
 }
 #voice-menu-overlay.visible { opacity: 1; visibility: visible; }
@@ -192,56 +166,33 @@ button {
   background: var(--paper); border-radius: 16px 16px 0 0;
   width: 100%; max-width: 500px; max-height: 60vh;
   padding: 16px 16px calc(16px + var(--safe-bottom));
-  transform: translateY(100%);
-  transition: transform 0.3s cubic-bezier(0.32,0.72,0,1);
+  transform: translateY(100%); transition: transform 0.3s cubic-bezier(0.32,0.72,0,1);
   overflow-y: auto; -webkit-overflow-scrolling: touch;
 }
 #voice-menu-overlay.visible #voice-menu { transform: translateY(0); }
 .voice-menu-handle { width: 36px; height: 5px; border-radius: 3px; background: var(--control-hover); margin: 0 auto 16px; }
 .voice-menu-title { font-size: 17px; font-weight: 700; margin-bottom: 12px; }
-
 .voice-option {
   display: flex; align-items: center; gap: 10px;
-  padding: 14px 8px; border-radius: 10px;
-  font-size: 15px; width: 100%; text-align: left;
+  padding: 14px 8px; border-radius: 10px; font-size: 15px; width: 100%; text-align: left;
 }
 .voice-option:active { background: var(--control-bg); }
 .voice-option.selected { color: var(--accent); font-weight: 600; }
 .voice-option .check { width: 20px; flex-shrink: 0; text-align: center; font-size: 16px; }
 .voice-option .voice-name { flex: 1; }
-.voice-option .voice-tag {
-  font-size: 11px; color: var(--text-secondary);
-  background: var(--control-bg); padding: 2px 6px; border-radius: 4px;
-}
-
-/* Download AI voice button in voice menu */
-.voice-download-section {
-  margin-top: 16px; padding-top: 16px;
-  border-top: 1px solid var(--bar-border);
-}
+.voice-option .voice-tag { font-size: 11px; color: var(--text-secondary); background: var(--control-bg); padding: 2px 6px; border-radius: 4px; }
+.voice-download-section { margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--bar-border); }
 .voice-download-btn {
   width: 100%; padding: 14px 16px; border-radius: 12px;
-  background: var(--accent); color: white;
-  font-size: 15px; font-weight: 600;
+  background: var(--accent); color: white; font-size: 15px; font-weight: 600;
   display: flex; align-items: center; justify-content: center; gap: 8px;
   transition: transform 0.12s;
 }
 .voice-download-btn:active { transform: scale(0.97); }
-.voice-download-btn.downloading {
-  background: var(--control-bg); color: var(--text-secondary);
-  pointer-events: none;
-}
-.voice-download-btn.done {
-  background: #34c759; pointer-events: none;
-}
-.voice-download-progress {
-  font-size: 13px; color: var(--text-secondary);
-  text-align: center; margin-top: 8px;
-}
-.voice-status-text {
-  font-size: 13px; color: var(--text-secondary);
-  text-align: center; padding: 8px; line-height: 1.4;
-}
+.voice-download-btn.downloading { background: var(--control-bg); color: var(--text-secondary); pointer-events: none; }
+.voice-download-btn.done { background: #34c759; pointer-events: none; }
+.voice-download-progress { font-size: 13px; color: var(--text-secondary); text-align: center; margin-top: 8px; line-height: 1.4; }
+.voice-status-text { font-size: 13px; color: var(--text-secondary); text-align: center; padding: 8px; }
 
 /* ── Loading ── */
 #loading-overlay {
