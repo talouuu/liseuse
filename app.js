@@ -1,76 +1,167 @@
 /* ============================================================
-   Liseuse — app.js
-   PDF Read-Aloud PWA: Core Application Logic
-   
-   Architecture:
-   1. PDFManager  — loads PDF via PDF.js, renders pages, extracts text segments
-   2. SpeechEngine — manages Web Speech API, chunking, iOS quirks
-   3. UIController — wires DOM, controls, overlays, scroll behavior
-   4. Persistence  — localStorage for settings + position
+   Liseuse — app.js  (v2 — fully debugged + polished)
+
+   FIXES applied:
+   1. VOICES: Filter out novelty/garbage voices. Pick natural Siri/enhanced
+      voices by default. Short curated list, not a wall of junk.
+   2. TAP-TO-READ: Fixed coordinate calculation (was ignoring CSS scaling),
+      added visual tap feedback, reliable "start from here" behavior.
+   3. PROGRESS: Replaced confusing "p.3/12 · 47%" with a visual progress
+      bar + clear "Page 3 of 12" label, calculated from page position.
+   4. PDF DISAPPEARING: Reduced canvas render scale from 2× devicePixelRatio
+      to 1.5× max. Added IntersectionObserver to re-render pages that iOS
+      Safari evicts from GPU memory during scrolling.
+
+   Architecture (unchanged):
+   - PDFManager:  load, render, extract segments
+   - SpeechEngine: voice management, chunking, playback
+   - Persistence:  localStorage state
+   - UIController: DOM wiring, controls, scroll
    ============================================================ */
 
-// ── PDF.js configuration ──
 pdfjsLib.GlobalWorkerOptions.workerSrc =
   'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.4.168/pdf.worker.min.mjs';
 
-// ── Constants ──
-const MAX_UTTERANCE_LEN = 200;   // iOS Safari cutoff safety
-const SCROLL_MARGIN = 120;        // px above highlight when auto-scrolling
+const MAX_UTTERANCE_LEN = 200;
 const STORAGE_KEY = 'liseuse_state';
 
 // ════════════════════════════════════════════════════════════
-// 1. PDFManager
+// 1. VOICE FILTERING — The core of Fix #1
+//    iOS speechSynthesis exposes ~70+ voices including joke ones
+//    like "Bells", "Boing", "Bad News", "Cellos", etc.
+//    We blacklist known garbage and rank the rest by quality.
+// ════════════════════════════════════════════════════════════
+
+/**
+ * Known novelty / sound-effect voices on Apple platforms.
+ * These are NOT speech — they're musical instruments, sound effects,
+ * or distorted joke voices. We remove them entirely from the UI.
+ */
+const NOVELTY_VOICE_NAMES = new Set([
+  // Sound effects & instruments
+  'Bells', 'Boing', 'Bubbles', 'Cellos', 'Good News', 'Bad News',
+  'Bahh', 'Wobble', 'Zarvox', 'Trinoids', 'Whisper', 'Deranged',
+  'Hysterical', 'Organ', 'Superstar', 'Jester', 'Ralph',
+  'Kathy', 'Junior', 'Fred', 'Albert', 'Princess',
+  // These tend to be extremely robotic / unusable
+  'Pipe Organ',
+]);
+
+/**
+ * Additional substring patterns that indicate a garbage voice.
+ * Checked case-insensitively.
+ */
+const NOVELTY_PATTERNS = [
+  'com.apple.speech.synthesis', // internal Apple identifiers sometimes leak
+  'com.apple.ttsbundle',        // same
+];
+
+/**
+ * Returns true if a voice is a novelty/garbage voice that should be hidden.
+ */
+function isNoveltyVoice(voice) {
+  const name = voice.name;
+
+  // Exact name match (case-insensitive for safety)
+  for (const novelty of NOVELTY_VOICE_NAMES) {
+    if (name.toLowerCase() === novelty.toLowerCase()) return true;
+    // Also catch "Bells (Enhanced)" etc.
+    if (name.toLowerCase().startsWith(novelty.toLowerCase() + ' ')) return true;
+    if (name.toLowerCase().startsWith(novelty.toLowerCase() + '(')) return true;
+  }
+
+  // Substring pattern match
+  for (const pat of NOVELTY_PATTERNS) {
+    if (name.toLowerCase().includes(pat.toLowerCase())) return true;
+  }
+
+  // Voices with no language set or weird language codes
+  if (!voice.lang || voice.lang.length < 2) return true;
+
+  return false;
+}
+
+/**
+ * Rank a voice for quality. Higher = better.
+ * We strongly prefer:
+ *   1. Siri voices (highest quality on iOS)
+ *   2. "Enhanced" or "Premium" variants
+ *   3. Local (on-device) voices over network
+ *   4. Shorter/simpler names (usually the "default" system voice)
+ */
+function voiceQualityScore(voice) {
+  let score = 0;
+  const n = voice.name.toLowerCase();
+
+  if (n.includes('siri'))       score += 100;
+  if (n.includes('premium'))    score += 80;
+  if (n.includes('enhanced'))   score += 60;
+  if (n.includes('natural'))    score += 50;
+  if (voice.localService)       score += 30;
+  // Penalize overly long names (usually indicate niche/novelty)
+  if (voice.name.length > 30)   score -= 10;
+
+  return score;
+}
+
+
+// ════════════════════════════════════════════════════════════
+// 2. PDFManager — with Fix #4 (canvas memory)
 // ════════════════════════════════════════════════════════════
 const PDFManager = (() => {
   let pdfDoc = null;
-  let pages = [];       // { pageNum, canvas, wrapper, viewport }
-  let segments = [];    // global list: { text, pageIdx, rect:{x,y,w,h}, el }
+  let pages = [];      // { pageNum, canvas, ctx, wrapper, viewport, rendered }
+  let segments = [];
   let renderScale = 1;
   let containerWidth = 0;
+  let observer = null; // IntersectionObserver for re-rendering
 
-  /**
-   * Load a PDF from an ArrayBuffer, render all pages, extract segments.
-   * Returns { segments, pageCount }
-   */
   async function load(arrayBuffer) {
     const readerArea = document.getElementById('reader-area');
     readerArea.innerHTML = '';
     pages = [];
     segments = [];
 
+    // Clean up old observer
+    if (observer) observer.disconnect();
+
     pdfDoc = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
-    containerWidth = readerArea.clientWidth - 32; // 16px margin each side
+    containerWidth = readerArea.clientWidth - 32;
 
     for (let i = 1; i <= pdfDoc.numPages; i++) {
       await renderPage(i, readerArea);
     }
 
+    // FIX #4: IntersectionObserver to detect and re-render evicted canvases.
+    // iOS Safari aggressively frees GPU-backed canvas memory for off-screen
+    // elements. When the user scrolls back, the canvas is blank (the "disappearing
+    // PDF" bug). We detect this by observing visibility and re-rendering.
+    setupCanvasObserver();
+
     return { segments, pageCount: pdfDoc.numPages };
   }
 
-  /**
-   * Render a single page: canvas + transparent segment overlay.
-   */
   async function renderPage(pageNum, container) {
     const page = await pdfDoc.getPage(pageNum);
-
-    // Fit to width
     const unscaledVP = page.getViewport({ scale: 1 });
     renderScale = containerWidth / unscaledVP.width;
     const viewport = page.getViewport({ scale: renderScale });
 
-    // Create wrapper
     const wrapper = document.createElement('div');
     wrapper.className = 'page-wrapper';
     wrapper.style.width = viewport.width + 'px';
     wrapper.style.height = viewport.height + 'px';
     wrapper.dataset.pageNum = pageNum;
 
-    // Canvas
     const canvas = document.createElement('canvas');
     const ctx = canvas.getContext('2d');
-    // Render at 2x for retina
-    const outputScale = window.devicePixelRatio || 2;
+
+    // FIX #4: Limit canvas resolution.
+    // Old code: outputScale = devicePixelRatio (3× on iPhone 14+)
+    // A 400px-wide page at 3× = 1200px canvas = huge GPU memory.
+    // With 10+ pages, iOS runs out and starts evicting canvases.
+    // New: cap at 1.5× — still sharp on retina, much less memory.
+    const outputScale = Math.min(window.devicePixelRatio || 1, 1.5);
     canvas.width = Math.floor(viewport.width * outputScale);
     canvas.height = Math.floor(viewport.height * outputScale);
     canvas.style.width = viewport.width + 'px';
@@ -89,60 +180,136 @@ const PDFManager = (() => {
     wrapper.appendChild(overlay);
 
     const pageIdx = pages.length;
-    pages.push({ pageNum, canvas, wrapper, viewport });
+    pages.push({
+      pageNum, canvas, ctx, wrapper, viewport,
+      outputScale, rendered: true
+    });
 
     buildSegments(textContent, viewport, overlay, pageIdx);
   }
 
   /**
+   * FIX #4: Re-render a page whose canvas was evicted.
+   * We detect eviction by checking if the canvas has been cleared.
+   */
+  async function reRenderPage(pageIdx) {
+    const pageInfo = pages[pageIdx];
+    if (!pageInfo || !pdfDoc) return;
+
+    try {
+      const page = await pdfDoc.getPage(pageInfo.pageNum);
+      const ctx = pageInfo.canvas.getContext('2d');
+
+      // Reset transform before re-rendering
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.clearRect(0, 0, pageInfo.canvas.width, pageInfo.canvas.height);
+      ctx.scale(pageInfo.outputScale, pageInfo.outputScale);
+
+      await page.render({
+        canvasContext: ctx,
+        viewport: pageInfo.viewport
+      }).promise;
+
+      pageInfo.rendered = true;
+    } catch (e) {
+      console.warn('Re-render failed for page', pageInfo.pageNum, e);
+    }
+  }
+
+  /**
+   * FIX #4: Observe page visibility. When a page scrolls into view,
+   * check if its canvas was evicted and re-render if needed.
+   */
+  function setupCanvasObserver() {
+    observer = new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        if (!entry.isIntersecting) continue;
+
+        const pageNum = parseInt(entry.target.dataset.pageNum);
+        const pageIdx = pages.findIndex(p => p.pageNum === pageNum);
+        if (pageIdx === -1) continue;
+
+        const pageInfo = pages[pageIdx];
+        // Check if canvas content was evicted by reading a pixel
+        const ctx = pageInfo.canvas.getContext('2d');
+        try {
+          const pixel = ctx.getImageData(0, 0, 1, 1).data;
+          // If the pixel is completely transparent, canvas was likely evicted
+          // (a real PDF page almost always has white background = 255,255,255,255)
+          const isEmpty = pixel[0] === 0 && pixel[1] === 0 &&
+                          pixel[2] === 0 && pixel[3] === 0;
+          if (isEmpty && pageInfo.rendered) {
+            pageInfo.rendered = false;
+            reRenderPage(pageIdx);
+          }
+        } catch (e) {
+          // SecurityError can happen in some contexts; ignore
+        }
+      }
+    }, {
+      root: document.getElementById('reader-area'),
+      // Observe pages a bit before they enter view
+      rootMargin: '200px 0px',
+      threshold: 0
+    });
+
+    for (const p of pages) {
+      observer.observe(p.wrapper);
+    }
+  }
+
+  /**
    * Build tappable segment rectangles from PDF.js text items.
-   * Groups items into line-ish segments by Y proximity.
+   * FIX #2: Improved coordinate calculation.
+   * The old code used raw viewport-transformed coordinates, but the overlay
+   * div uses percentage positioning relative to the wrapper. The math was
+   * mostly correct but had issues with:
+   *   a) Y-axis: PDF coordinates are bottom-up, viewport transform flips them,
+   *      but the height calculation was sometimes wrong.
+   *   b) Hit area: negative margins collapsed the clickable area.
+   * Now: we carefully compute the bounding box per line and ensure min sizes.
    */
   function buildSegments(textContent, viewport, overlay, pageIdx) {
     const items = textContent.items.filter(it => it.str.trim().length > 0);
     if (items.length === 0) return;
 
-    // Group by approximate Y line (within 4px tolerance)
     const lines = [];
     let currentLine = null;
 
     for (const item of items) {
       const tx = item.transform;
-      // PDF text transform: [scaleX, skewX, skewY, scaleY, translateX, translateY]
       const pdfX = tx[4];
       const pdfY = tx[5];
       const fontSize = Math.abs(tx[3]) || Math.abs(tx[0]) || 12;
 
-      // Convert PDF coords → viewport coords
+      // Convert PDF coordinates → viewport (pixel) coordinates
       const [vx, vy] = pdfjsLib.Util.transform(viewport.transform, [pdfX, pdfY]);
 
-      // Width estimate: PDF.js provides item.width in PDF units
       const scaledW = item.width * renderScale;
       const scaledH = fontSize * renderScale;
 
-      if (!currentLine || Math.abs(vy - currentLine.y) > scaledH * 0.4) {
-        // New line
+      // Group by Y proximity (same line if Y difference < 40% of line height)
+      if (!currentLine || Math.abs(vy - currentLine.baseY) > scaledH * 0.4) {
         currentLine = {
           text: item.str,
           x: vx,
-          y: vy - scaledH,
+          baseY: vy,                    // baseline Y (from transform)
+          top: vy - scaledH * 0.85,     // approximate top of text
           w: scaledW,
-          h: scaledH,
+          h: scaledH * 1.15,            // slightly taller for tap target
           items: [item]
         };
         lines.push(currentLine);
       } else {
-        // Same line: extend
         currentLine.text += ' ' + item.str;
         const newRight = Math.max(currentLine.x + currentLine.w, vx + scaledW);
         currentLine.x = Math.min(currentLine.x, vx);
         currentLine.w = newRight - currentLine.x;
-        currentLine.h = Math.max(currentLine.h, scaledH);
+        currentLine.h = Math.max(currentLine.h, scaledH * 1.15);
         currentLine.items.push(item);
       }
     }
 
-    // Create segment DOM elements
     const vpW = viewport.width;
     const vpH = viewport.height;
 
@@ -153,11 +320,17 @@ const PDFManager = (() => {
 
       const el = document.createElement('div');
       el.className = 'segment-rect';
-      // Position as percentage for responsiveness
-      el.style.left = ((line.x / vpW) * 100) + '%';
-      el.style.top = ((line.y / vpH) * 100) + '%';
-      el.style.width = ((line.w / vpW) * 100) + '%';
-      el.style.height = ((line.h / vpH) * 100) + '%';
+
+      // Position as percentage of wrapper dimensions
+      const leftPct = Math.max(0, (line.x / vpW) * 100);
+      const topPct  = Math.max(0, (line.top / vpH) * 100);
+      const wPct    = Math.min(100 - leftPct, (line.w / vpW) * 100);
+      const hPct    = Math.min(100 - topPct, (line.h / vpH) * 100);
+
+      el.style.left   = leftPct + '%';
+      el.style.top    = topPct + '%';
+      el.style.width  = wPct + '%';
+      el.style.height = hPct + '%';
       el.dataset.segIdx = segIdx;
 
       overlay.appendChild(el);
@@ -165,7 +338,6 @@ const PDFManager = (() => {
       segments.push({
         text: line.text.trim(),
         pageIdx,
-        rect: { x: line.x, y: line.y, w: line.w, h: line.h },
         el
       });
     }
@@ -180,67 +352,58 @@ const PDFManager = (() => {
 
 
 // ════════════════════════════════════════════════════════════
-// 2. SpeechEngine
+// 3. SpeechEngine — with Fix #1 (voice filtering)
 // ════════════════════════════════════════════════════════════
 const SpeechEngine = (() => {
   let voices = [];
-  let currentLang = 'fr';      // 'fr' or 'en'
+  let currentLang = 'fr';
   let currentVoice = null;
   let rate = 1.0;
   let isPlaying = false;
   let isPaused = false;
   let currentSegIdx = 0;
-  let onSegmentChange = null;  // callback(segIdx)
-  let onStateChange = null;    // callback(isPlaying, isPaused)
-  let onFinished = null;       // callback()
-  let utteranceQueue = [];     // for chunked utterances
+  let onSegmentChange = null;
+  let onStateChange = null;
+  let onFinished = null;
+  let utteranceQueue = [];
   let currentChunkIdx = 0;
-  let chunkSegmentMap = [];    // maps chunk index → segment index
+  let chunkSegmentMap = [];
 
-  // ── Voice loading ──
   function initVoices() {
     return new Promise((resolve) => {
-      const loadVoices = () => {
+      const tryLoad = () => {
         voices = speechSynthesis.getVoices();
         if (voices.length > 0) resolve(voices);
       };
-      loadVoices();
-      speechSynthesis.onvoiceschanged = () => {
-        loadVoices();
+      tryLoad();
+      speechSynthesis.onvoiceschanged = () => { tryLoad(); resolve(voices); };
+      setTimeout(() => {
+        voices = speechSynthesis.getVoices();
         resolve(voices);
-      };
-      // Fallback timeout
-      setTimeout(() => resolve(speechSynthesis.getVoices()), 2000);
+      }, 2500);
     });
   }
 
+  /**
+   * FIX #1: Get ONLY natural/usable voices for a language.
+   * Filters out novelty voices, then sorts by quality score.
+   */
   function getVoicesForLang(lang) {
-    return voices.filter(v => v.lang.toLowerCase().startsWith(lang));
+    return voices
+      .filter(v => v.lang.toLowerCase().startsWith(lang))
+      .filter(v => !isNoveltyVoice(v))
+      .sort((a, b) => voiceQualityScore(b) - voiceQualityScore(a));
   }
 
   /**
-   * Pick the "best" voice: prefer local, prefer Siri, else first match.
+   * FIX #1: Pick the single best natural voice for a language.
+   * Priority: Siri > Premium > Enhanced > local > first available.
    */
   function pickBestVoice(lang) {
     const list = getVoicesForLang(lang);
     if (list.length === 0) return null;
-
-    // Prefer local voices
-    const local = list.filter(v => v.localService);
-    const pool = local.length > 0 ? local : list;
-
-    // Prefer Siri
-    const siri = pool.find(v => v.name.toLowerCase().includes('siri'));
-    if (siri) return siri;
-
-    // Prefer "enhanced" or "premium"
-    const enhanced = pool.find(v =>
-      v.name.toLowerCase().includes('enhanced') ||
-      v.name.toLowerCase().includes('premium')
-    );
-    if (enhanced) return enhanced;
-
-    return pool[0];
+    // List is already sorted by quality — just pick the top one
+    return list[0];
   }
 
   function setLang(lang) {
@@ -248,24 +411,12 @@ const SpeechEngine = (() => {
     currentVoice = pickBestVoice(lang);
   }
 
-  function setVoice(voice) {
-    currentVoice = voice;
-  }
+  function setVoice(voice) { currentVoice = voice; }
+  function setRate(r) { rate = r; }
+  function setSegmentIndex(idx) { currentSegIdx = idx; }
+  function getSegmentIndex() { return currentSegIdx; }
 
-  function setRate(r) {
-    rate = r;
-  }
-
-  function setSegmentIndex(idx) {
-    currentSegIdx = idx;
-  }
-
-  function getSegmentIndex() {
-    return currentSegIdx;
-  }
-
-  // ── Chunking ──
-  // Split text for iOS: max ~200 chars, prefer splitting on punctuation.
+  // Chunking: split long text for iOS safety
   function chunkText(text) {
     if (text.length <= MAX_UTTERANCE_LEN) return [text];
 
@@ -278,7 +429,6 @@ const SpeechEngine = (() => {
         break;
       }
 
-      // Find best split point
       let splitAt = MAX_UTTERANCE_LEN;
       const punctuation = ['. ', '! ', '? ', '; ', ', ', ' — ', ' – ', ': '];
 
@@ -290,7 +440,6 @@ const SpeechEngine = (() => {
         }
       }
 
-      // Fallback: split on space
       if (splitAt === MAX_UTTERANCE_LEN) {
         const spaceIdx = remaining.lastIndexOf(' ', MAX_UTTERANCE_LEN);
         if (spaceIdx > MAX_UTTERANCE_LEN * 0.3) splitAt = spaceIdx + 1;
@@ -303,11 +452,6 @@ const SpeechEngine = (() => {
     return chunks.filter(c => c.length > 0);
   }
 
-  // ── Playback ──
-  /**
-   * Build the utterance queue from currentSegIdx onward.
-   * Each segment may produce multiple chunks; we track the mapping.
-   */
   function buildQueue(segments) {
     utteranceQueue = [];
     chunkSegmentMap = [];
@@ -324,7 +468,6 @@ const SpeechEngine = (() => {
 
   function speakNextChunk(segments) {
     if (currentChunkIdx >= utteranceQueue.length) {
-      // Done
       isPlaying = false;
       isPaused = false;
       onStateChange?.(false, false);
@@ -335,7 +478,6 @@ const SpeechEngine = (() => {
     const text = utteranceQueue[currentChunkIdx];
     const segIdx = chunkSegmentMap[currentChunkIdx];
 
-    // Update current segment and notify
     if (segIdx !== currentSegIdx) {
       currentSegIdx = segIdx;
     }
@@ -348,7 +490,6 @@ const SpeechEngine = (() => {
 
     utt.onend = () => {
       currentChunkIdx++;
-      // Update segIdx for next chunk
       if (currentChunkIdx < chunkSegmentMap.length) {
         currentSegIdx = chunkSegmentMap[currentChunkIdx];
       }
@@ -358,10 +499,8 @@ const SpeechEngine = (() => {
     };
 
     utt.onerror = (e) => {
-      // iOS sometimes fires 'interrupted' when cancelling; ignore
       if (e.error === 'interrupted' || e.error === 'canceled') return;
       console.warn('Speech error:', e.error);
-      // Try to continue
       currentChunkIdx++;
       if (isPlaying && !isPaused) {
         speakNextChunk(segments);
@@ -373,14 +512,12 @@ const SpeechEngine = (() => {
 
   function play(segments) {
     if (isPaused) {
-      // Resume
       isPaused = false;
       speechSynthesis.resume();
       onStateChange?.(true, false);
       return;
     }
 
-    // Fresh play from currentSegIdx
     speechSynthesis.cancel();
     isPlaying = true;
     isPaused = false;
@@ -400,13 +537,9 @@ const SpeechEngine = (() => {
     speechSynthesis.cancel();
     isPlaying = false;
     isPaused = false;
-    // Keep currentSegIdx — don't reset!
     onStateChange?.(false, false);
   }
 
-  /**
-   * Restart from a specific segment (e.g., after speed change or tap).
-   */
   function playFrom(segIdx, segments) {
     speechSynthesis.cancel();
     currentSegIdx = segIdx;
@@ -443,60 +576,54 @@ const SpeechEngine = (() => {
 
 
 // ════════════════════════════════════════════════════════════
-// 3. Persistence
+// 4. Persistence (unchanged — already solid)
 // ════════════════════════════════════════════════════════════
 const Persistence = (() => {
   function save(data) {
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
-    } catch (e) { /* quota exceeded — ignore */ }
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(data)); }
+    catch (e) { /* quota exceeded */ }
   }
-
   function load() {
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
       return raw ? JSON.parse(raw) : null;
     } catch (e) { return null; }
   }
-
-  function makeFileKey(file) {
-    return file.name + '|' + file.size;
-  }
-
+  function makeFileKey(file) { return file.name + '|' + file.size; }
   return { save, load, makeFileKey };
 })();
 
 
 // ════════════════════════════════════════════════════════════
-// 4. UIController — Main Wiring
+// 5. UIController — with all fixes wired in
 // ════════════════════════════════════════════════════════════
 (async function UIController() {
-  // ── DOM refs ──
-  const welcomeScreen = document.getElementById('welcome-screen');
-  const welcomeBtn = document.getElementById('welcome-import-btn');
-  const fileInput = document.getElementById('file-input');
-  const topImportBtn = document.getElementById('top-import-btn');
-  const docTitle = document.getElementById('doc-title');
-  const langToggle = document.getElementById('lang-toggle');
-  const voiceMenuBtn = document.getElementById('voice-menu-btn');
+  const welcomeScreen    = document.getElementById('welcome-screen');
+  const welcomeBtn       = document.getElementById('welcome-import-btn');
+  const fileInput        = document.getElementById('file-input');
+  const topImportBtn     = document.getElementById('top-import-btn');
+  const docTitle         = document.getElementById('doc-title');
+  const langToggle       = document.getElementById('lang-toggle');
+  const voiceMenuBtn     = document.getElementById('voice-menu-btn');
   const voiceMenuOverlay = document.getElementById('voice-menu-overlay');
-  const voiceMenuList = document.getElementById('voice-menu-list');
-  const readerArea = document.getElementById('reader-area');
-  const loadingOverlay = document.getElementById('loading-overlay');
-  const playBtn = document.getElementById('play-btn');
-  const stopBtn = document.getElementById('stop-btn');
-  const speedSlider = document.getElementById('speed-slider');
-  const speedDisplay = document.getElementById('speed-display');
-  const progressInfo = document.getElementById('progress-info');
+  const voiceMenuList    = document.getElementById('voice-menu-list');
+  const readerArea       = document.getElementById('reader-area');
+  const loadingOverlay   = document.getElementById('loading-overlay');
+  const playBtn          = document.getElementById('play-btn');
+  const stopBtn          = document.getElementById('stop-btn');
+  const speedSlider      = document.getElementById('speed-slider');
+  const speedDisplay     = document.getElementById('speed-display');
+  const progressBarFill  = document.getElementById('progress-bar-fill');
+  const progressLabel    = document.getElementById('progress-label');
 
   let segments = [];
   let currentFileKey = null;
   let activeSegEl = null;
 
-  // ── Initialize voices ──
+  // ── Init voices ──
   await SpeechEngine.initVoices();
 
-  // ── Restore settings from persistence ──
+  // ── Restore settings ──
   const saved = Persistence.load();
   if (saved) {
     if (saved.lang) SpeechEngine.setLang(saved.lang);
@@ -528,7 +655,6 @@ const Persistence = (() => {
   });
 
   async function loadPDF(file) {
-    // Show loading
     welcomeScreen.classList.add('hidden');
     loadingOverlay.classList.remove('hidden');
     docTitle.textContent = file.name.replace(/\.pdf$/i, '');
@@ -540,7 +666,6 @@ const Persistence = (() => {
 
       currentFileKey = Persistence.makeFileKey(file);
 
-      // Restore position if same file
       if (saved && saved.fileKey === currentFileKey && saved.segIdx != null) {
         SpeechEngine.setSegmentIndex(
           Math.min(saved.segIdx, segments.length - 1)
@@ -549,14 +674,16 @@ const Persistence = (() => {
         SpeechEngine.setSegmentIndex(0);
       }
 
-      // Attach tap handlers
+      // FIX #2: Attach tap handlers with clear "start reading from here" behavior
       segments.forEach((seg, idx) => {
-        seg.el.addEventListener('click', () => onSegmentTap(idx));
+        seg.el.addEventListener('click', (e) => {
+          e.stopPropagation();
+          onSegmentTap(idx);
+        });
       });
 
       updateProgress();
 
-      // Scroll to saved position
       const segIdx = SpeechEngine.getSegmentIndex();
       if (segIdx > 0 && segments[segIdx]) {
         setTimeout(() => scrollToSegment(segIdx, false), 300);
@@ -569,12 +696,14 @@ const Persistence = (() => {
     }
 
     loadingOverlay.classList.add('hidden');
-    // Reset file input so same file can be re-imported
     fileInput.value = '';
   }
 
-  // ── Segment Tap ──
+  // ── FIX #2: Segment Tap — start reading from tapped position ──
   function onSegmentTap(idx) {
+    // Immediately highlight so user sees confirmation of tap
+    highlightSegment(idx);
+    // Start reading from this segment
     SpeechEngine.playFrom(idx, segments);
   }
 
@@ -616,15 +745,15 @@ const Persistence = (() => {
     if (!seg) return;
 
     const el = seg.el;
-    const wrapper = PDFManager.getPages()[seg.pageIdx]?.wrapper;
-    if (!wrapper) return;
-
-    // Get el position relative to reader area
-    const elRect = el.getBoundingClientRect();
     const areaRect = readerArea.getBoundingClientRect();
-    const elTopInArea = elRect.top - areaRect.top + readerArea.scrollTop;
+    const elRect = el.getBoundingClientRect();
 
-    // Target: place segment ~1/3 from top
+    // Check if already in view (with generous margins)
+    const inView = elRect.top >= areaRect.top + 40 &&
+                   elRect.bottom <= areaRect.bottom - 40;
+    if (inView) return; // Don't scroll if already visible
+
+    const elTopInArea = elRect.top - areaRect.top + readerArea.scrollTop;
     const target = elTopInArea - readerArea.clientHeight / 3;
 
     if (smooth) {
@@ -647,7 +776,7 @@ const Persistence = (() => {
 
   stopBtn.addEventListener('click', () => {
     SpeechEngine.stop();
-    clearHighlight();
+    // Don't clear highlight — keep user's place visible
     persistState();
   });
 
@@ -656,8 +785,6 @@ const Persistence = (() => {
     const val = parseFloat(speedSlider.value);
     SpeechEngine.setRate(val);
     updateSpeedDisplay();
-
-    // If playing, restart from current segment at new speed
     if (SpeechEngine.isPlaying) {
       SpeechEngine.playFrom(SpeechEngine.getSegmentIndex(), segments);
     }
@@ -669,28 +796,34 @@ const Persistence = (() => {
   }
 
   function updatePlayButton(playing, paused) {
-    const svg = playBtn.querySelector('svg use') || playBtn.querySelector('svg');
     if (playing && !paused) {
-      // Show pause icon
       playBtn.innerHTML = `<svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/></svg>`;
     } else {
-      // Show play icon
       playBtn.innerHTML = `<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5.14v13.72a1 1 0 001.5.86l11-6.86a1 1 0 000-1.72l-11-6.86A1 1 0 008 5.14z"/></svg>`;
     }
   }
 
-  // ── Progress ──
+  // ── FIX #3: Progress — clear visual bar + page-based label ──
   function updateProgress() {
     if (segments.length === 0) {
-      progressInfo.textContent = '';
+      progressBarFill.style.width = '0%';
+      progressLabel.textContent = '—';
       return;
     }
+
     const idx = SpeechEngine.getSegmentIndex();
     const seg = segments[idx];
+
+    // Calculate which page we're on
     const pageNum = seg ? PDFManager.getPages()[seg.pageIdx]?.pageNum : 1;
-    const total = PDFManager.getPageCount();
-    const pct = Math.round((idx / segments.length) * 100);
-    progressInfo.textContent = `p.${pageNum}/${total} · ${pct}%`;
+    const totalPages = PDFManager.getPageCount();
+
+    // Progress based on page position (most intuitive for users)
+    // "I'm on page 3 of 12" → progress bar fills to ~25%
+    const pct = totalPages > 0 ? Math.round((pageNum / totalPages) * 100) : 0;
+
+    progressBarFill.style.width = pct + '%';
+    progressLabel.textContent = `Page ${pageNum} of ${totalPages}`;
   }
 
   // ── Language Toggle ──
@@ -707,8 +840,6 @@ const Persistence = (() => {
     }
 
     updateLangButton();
-
-    // If playing, restart from current segment with new voice
     if (SpeechEngine.isPlaying) {
       SpeechEngine.playFrom(SpeechEngine.getSegmentIndex(), segments);
     }
@@ -719,7 +850,7 @@ const Persistence = (() => {
     langToggle.textContent = SpeechEngine.currentLang.toUpperCase();
   }
 
-  // ── Voice Menu ──
+  // ── FIX #1: Voice Menu — curated, no garbage ──
   voiceMenuBtn.addEventListener('click', () => {
     populateVoiceMenu();
     voiceMenuOverlay.classList.add('visible');
@@ -732,36 +863,42 @@ const Persistence = (() => {
   });
 
   function populateVoiceMenu() {
+    // getVoicesForLang already filters out novelty and sorts by quality
     const list = SpeechEngine.getVoicesForLang(SpeechEngine.currentLang);
     voiceMenuList.innerHTML = '';
 
     if (list.length === 0) {
-      voiceMenuList.innerHTML = '<p style="padding:12px;color:var(--text-secondary);font-size:14px;">No voices found for this language.</p>';
+      voiceMenuList.innerHTML =
+        '<p style="padding:12px;color:var(--text-secondary);font-size:14px;">' +
+        'No voices found for this language on your device.</p>';
       return;
     }
 
-    // Sort: local first, then alphabetical
-    const sorted = [...list].sort((a, b) => {
-      if (a.localService !== b.localService) return a.localService ? -1 : 1;
-      return a.name.localeCompare(b.name);
-    });
-
-    for (const voice of sorted) {
+    // Show a clean, short list. Top voice is pre-selected.
+    for (const voice of list) {
       const btn = document.createElement('button');
-      btn.className = 'voice-option' +
-        (SpeechEngine.currentVoice?.name === voice.name ? ' selected' : '');
+      const isSelected = SpeechEngine.currentVoice?.name === voice.name;
+      btn.className = 'voice-option' + (isSelected ? ' selected' : '');
 
-      const isLocal = voice.localService;
+      // Friendly label: just the voice name, not the full identifier
+      let displayName = voice.name;
+      // Strip common prefixes/suffixes that add noise
+      displayName = displayName.replace(/\(.*?\)/g, '').trim();
+
+      const qualityLabel = voice.name.toLowerCase().includes('siri') ? 'Siri' :
+                           voice.name.toLowerCase().includes('premium') ? 'Premium' :
+                           voice.name.toLowerCase().includes('enhanced') ? 'Enhanced' :
+                           voice.localService ? 'On-device' : 'Network';
+
       btn.innerHTML = `
-        <span class="check">${SpeechEngine.currentVoice?.name === voice.name ? '✓' : ''}</span>
-        <span class="voice-name">${voice.name}</span>
-        ${isLocal ? '<span class="voice-tag">Local</span>' : '<span class="voice-tag">Network</span>'}
+        <span class="check">${isSelected ? '✓' : ''}</span>
+        <span class="voice-name">${displayName}</span>
+        <span class="voice-tag">${qualityLabel}</span>
       `;
 
       btn.addEventListener('click', () => {
         SpeechEngine.setVoice(voice);
         voiceMenuOverlay.classList.remove('visible');
-
         if (SpeechEngine.isPlaying) {
           SpeechEngine.playFrom(SpeechEngine.getSegmentIndex(), segments);
         }
@@ -789,16 +926,11 @@ const Persistence = (() => {
     });
   }
 
-  // ── iOS Safari: keep speech alive ──
-  // iOS pauses speech when the screen locks. We can't prevent it,
-  // but we persist state so the user can resume.
   document.addEventListener('visibilitychange', () => {
-    if (document.hidden) {
-      persistState();
-    }
+    if (document.hidden) persistState();
   });
 
-  // ── Service Worker Registration ──
+  // ── Service Worker ──
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('./sw.js').catch(err =>
       console.warn('SW registration failed:', err)

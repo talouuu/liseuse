@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no, maximum-scale=1">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="default">
   <meta name="apple-mobile-web-app-title" content="Liseuse">
@@ -12,18 +12,15 @@
   <!-- PWA Manifest -->
   <link rel="manifest" href="./manifest.json">
 
-  <!-- Apple touch icon (inline SVG as data URI) -->
+  <!-- Apple touch icon -->
   <link rel="apple-touch-icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'><rect width='512' height='512' rx='90' fill='%23f2f0eb'/><text x='256' y='340' font-size='280' text-anchor='middle' font-family='Georgia,serif' fill='%23c45d3e'>L</text></svg>">
 
   <!-- Styles -->
   <link rel="stylesheet" href="./styles.css">
-
-  <!-- PDF.js via CDN (ES Module build) -->
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.4.168/pdf.min.mjs" type="module"></script>
 </head>
 <body>
 
-  <!-- ═══ Hidden file input ═══ -->
+  <!-- Hidden file input -->
   <input type="file" id="file-input" accept="application/pdf" hidden>
 
   <!-- ═══ Welcome Screen ═══ -->
@@ -41,20 +38,16 @@
 
   <!-- ═══ Top Bar ═══ -->
   <header id="top-bar">
-    <!-- Import button -->
     <button class="bar-btn" id="top-import-btn" aria-label="Import PDF">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
         <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
       </svg>
     </button>
 
-    <!-- Document title -->
     <div id="doc-title">Liseuse</div>
 
-    <!-- Language toggle -->
     <button id="lang-toggle" aria-label="Toggle language">FR</button>
 
-    <!-- Voice selection (⋯ menu) -->
     <button class="bar-btn" id="voice-menu-btn" aria-label="Voice selection">
       <svg viewBox="0 0 24 24" fill="currentColor">
         <circle cx="5" cy="12" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="19" cy="12" r="2"/>
@@ -62,7 +55,7 @@
     </button>
   </header>
 
-  <!-- ═══ Reader Area (PDF pages) ═══ -->
+  <!-- ═══ Reader Area ═══ -->
   <main id="reader-area"></main>
 
   <!-- ═══ Loading Overlay ═══ -->
@@ -73,31 +66,33 @@
 
   <!-- ═══ Bottom Player Bar ═══ -->
   <footer id="bottom-bar">
-    <!-- Play / Pause -->
     <button class="player-btn" id="play-btn" aria-label="Play or Pause">
       <svg viewBox="0 0 24 24" fill="currentColor">
         <path d="M8 5.14v13.72a1 1 0 001.5.86l11-6.86a1 1 0 000-1.72l-11-6.86A1 1 0 008 5.14z"/>
       </svg>
     </button>
 
-    <!-- Stop -->
     <button class="player-btn" id="stop-btn" aria-label="Stop">
       <svg viewBox="0 0 24 24" fill="currentColor">
         <rect x="6" y="6" width="12" height="12" rx="2"/>
       </svg>
     </button>
 
-    <!-- Speed control -->
     <div class="speed-control">
       <input type="range" id="speed-slider" min="0.8" max="2.0" step="0.1" value="1.0">
       <span id="speed-display">1.0×</span>
     </div>
 
-    <!-- Progress -->
-    <div class="progress-info" id="progress-info"></div>
+    <!-- New: progress bar + page label -->
+    <div class="progress-area">
+      <div class="progress-bar-track">
+        <div class="progress-bar-fill" id="progress-bar-fill"></div>
+      </div>
+      <div class="progress-label" id="progress-label">—</div>
+    </div>
   </footer>
 
-  <!-- ═══ Voice Selection Menu (bottom sheet) ═══ -->
+  <!-- ═══ Voice Selection Menu ═══ -->
   <div id="voice-menu-overlay">
     <div id="voice-menu">
       <div class="voice-menu-handle"></div>
@@ -107,13 +102,10 @@
   </div>
 
   <!-- ═══ Scripts ═══ -->
-  <!-- PDF.js loaded as module; app.js uses it globally -->
   <script type="module">
-    // Import PDF.js and expose globally before app.js runs
     import * as pdfjsLib from 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.4.168/pdf.min.mjs';
     window.pdfjsLib = pdfjsLib;
 
-    // Now load app
     const script = document.createElement('script');
     script.src = './app.js';
     document.body.appendChild(script);

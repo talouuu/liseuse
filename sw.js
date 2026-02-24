@@ -1,7 +1,5 @@
-// sw.js — Minimal service worker for PWA installability
-// Strategy: Cache-first for app shell, network-first for CDN resources
-
-const CACHE_NAME = 'liseuse-v1';
+// sw.js — Service worker for PWA installability
+const CACHE_NAME = 'liseuse-v2';
 const APP_SHELL = [
   './',
   './index.html',
@@ -29,7 +27,6 @@ self.addEventListener('activate', (e) => {
 self.addEventListener('fetch', (e) => {
   const url = new URL(e.request.url);
 
-  // For CDN resources (PDF.js), try network first, fall back to cache
   if (url.origin !== location.origin) {
     e.respondWith(
       fetch(e.request)
@@ -43,7 +40,6 @@ self.addEventListener('fetch', (e) => {
     return;
   }
 
-  // App shell: cache first
   e.respondWith(
     caches.match(e.request).then((cached) => cached || fetch(e.request))
   );

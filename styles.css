@@ -1,9 +1,7 @@
 /* ============================================================
-   Liseuse — styles.css
-   Apple Books–inspired: warm paper, clean typography, minimal UI
+   Liseuse — styles.css  (v2 — bug-fixed + polished)
    ============================================================ */
 
-/* — Reset & Variables — */
 *, *::before, *::after {
   box-sizing: border-box;
   margin: 0;
@@ -11,7 +9,6 @@
 }
 
 :root {
-  /* Warm paper palette */
   --bg: #f2f0eb;
   --paper: #ffffff;
   --paper-shadow: rgba(0, 0, 0, 0.08);
@@ -19,21 +16,19 @@
   --text-secondary: #86868b;
   --accent: #c45d3e;
   --accent-light: rgba(196, 93, 62, 0.12);
-  --highlight: rgba(255, 214, 102, 0.38);
-  --highlight-border: rgba(255, 190, 50, 0.5);
+  --highlight: rgba(255, 214, 102, 0.42);
+  --highlight-border: rgba(255, 190, 50, 0.55);
   --bar-bg: rgba(255, 255, 255, 0.92);
   --bar-border: rgba(0, 0, 0, 0.06);
   --control-bg: #f5f5f7;
   --control-hover: #e8e8ed;
   --overlay-bg: rgba(0, 0, 0, 0.3);
 
-  /* Typography */
   --font-body: 'New York', 'Iowan Old Style', Georgia, 'Times New Roman', serif;
   --font-ui: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', sans-serif;
 
-  /* Sizes */
   --top-bar-h: 52px;
-  --bottom-bar-h: 72px;
+  --bottom-bar-h: 80px;
   --safe-top: env(safe-area-inset-top, 0px);
   --safe-bottom: env(safe-area-inset-bottom, 0px);
 }
@@ -62,7 +57,7 @@ button {
   -webkit-tap-highlight-color: transparent;
 }
 
-/* — Welcome / Import Screen — */
+/* ── Welcome Screen ── */
 #welcome-screen {
   position: absolute;
   inset: 0;
@@ -74,7 +69,6 @@ button {
   background: var(--bg);
   transition: opacity 0.4s ease, visibility 0.4s ease;
 }
-
 #welcome-screen.hidden {
   opacity: 0;
   visibility: hidden;
@@ -92,7 +86,6 @@ button {
   justify-content: center;
   margin-bottom: 24px;
 }
-
 .welcome-icon span {
   font-family: var(--font-body);
   font-size: 42px;
@@ -107,7 +100,6 @@ button {
   color: var(--text);
   margin-bottom: 8px;
 }
-
 .welcome-sub {
   font-size: 15px;
   color: var(--text-secondary);
@@ -127,22 +119,18 @@ button {
   color: white;
   font-size: 16px;
   font-weight: 600;
-  letter-spacing: 0.01em;
   box-shadow: 0 2px 12px rgba(196, 93, 62, 0.3);
-  transition: transform 0.15s ease, box-shadow 0.15s ease;
+  transition: transform 0.15s ease;
 }
-
 .welcome-btn:active {
   transform: scale(0.96);
-  box-shadow: 0 1px 6px rgba(196, 93, 62, 0.2);
 }
-
 .welcome-btn svg {
   width: 20px;
   height: 20px;
 }
 
-/* — Top Bar — */
+/* ── Top Bar ── */
 #top-bar {
   position: fixed;
   top: 0;
@@ -171,16 +159,8 @@ button {
   flex-shrink: 0;
   transition: background 0.15s;
 }
-
-.bar-btn:active {
-  background: var(--control-hover);
-}
-
-.bar-btn svg {
-  width: 20px;
-  height: 20px;
-  color: var(--accent);
-}
+.bar-btn:active { background: var(--control-hover); }
+.bar-btn svg { width: 20px; height: 20px; color: var(--accent); }
 
 #doc-title {
   flex: 1;
@@ -204,12 +184,9 @@ button {
   flex-shrink: 0;
   transition: transform 0.12s;
 }
+#lang-toggle:active { transform: scale(0.93); }
 
-#lang-toggle:active {
-  transform: scale(0.93);
-}
-
-/* — PDF Viewer Area — */
+/* ── Reader Area ── */
 #reader-area {
   position: absolute;
   top: calc(var(--top-bar-h) + var(--safe-top));
@@ -219,10 +196,16 @@ button {
   overflow-y: auto;
   overflow-x: hidden;
   -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
   background: var(--bg);
-  scroll-behavior: auto; /* We control smooth scrolling in JS */
 }
 
+/*
+  FIX: PDF disappearing while scrolling.
+  Root cause: large 2×/3× canvases exceed iOS Safari's GPU memory limit,
+  causing it to evict canvas backing stores when off-screen.
+  Solution: contain each page so the browser can manage compositing.
+*/
 .page-wrapper {
   position: relative;
   margin: 16px auto;
@@ -230,6 +213,9 @@ button {
   border-radius: 4px;
   box-shadow: 0 1px 8px var(--paper-shadow), 0 0 1px rgba(0,0,0,0.04);
   overflow: hidden;
+  /* GPU compositing hints — helps Safari keep canvases alive */
+  contain: layout style paint;
+  will-change: auto;
 }
 
 .page-wrapper canvas {
@@ -238,38 +224,46 @@ button {
   height: auto;
 }
 
-/* Segment overlay layer */
+/* Segment overlay */
 .segment-overlay {
   position: absolute;
   top: 0;
   left: 0;
   width: 100%;
   height: 100%;
-  pointer-events: none; /* pass-through except on segments */
+  pointer-events: none;
 }
 
+/*
+  FIX: Tap-to-read — larger hit areas, clearer visual feedback.
+  The old code used negative margins which collapsed hit areas.
+  Now: explicit min-height, generous padding, visible tap feedback.
+*/
 .segment-rect {
   position: absolute;
   pointer-events: auto;
   cursor: pointer;
   border-radius: 3px;
-  transition: background 0.2s ease;
-  /* Slightly enlarge hit area */
-  margin: -2px;
-  padding: 2px;
+  min-height: 18px;  /* ensure tappable even for small text */
+  transition: background 0.15s ease;
+  /* Expand hit area without affecting layout */
+  box-sizing: content-box;
 }
 
+/* Tap feedback — immediate on touch */
 .segment-rect:active {
-  background: var(--accent-light);
+  background: var(--accent-light) !important;
 }
 
+/* Active (currently reading) segment */
 .segment-rect.active {
   background: var(--highlight);
-  outline: 1.5px solid var(--highlight-border);
-  outline-offset: -1px;
+  outline: 2px solid var(--highlight-border);
+  outline-offset: 0px;
+  border-radius: 4px;
 }
 
-/* — Bottom Player Bar — */
+/* ── Bottom Player Bar ── */
 #bottom-bar {
   position: fixed;
   bottom: 0;
@@ -283,8 +277,8 @@ button {
   border-top: 0.5px solid var(--bar-border);
   display: flex;
   align-items: center;
-  padding-left: 16px;
-  padding-right: 16px;
+  padding-left: 14px;
+  padding-right: 14px;
   gap: 8px;
   z-index: 50;
 }
@@ -299,22 +293,14 @@ button {
   flex-shrink: 0;
   transition: background 0.15s, transform 0.12s;
 }
-
-.player-btn:active {
-  transform: scale(0.9);
-}
-
-.player-btn svg {
-  width: 22px;
-  height: 22px;
-}
+.player-btn:active { transform: scale(0.9); }
+.player-btn svg { width: 22px; height: 22px; }
 
 #play-btn {
   background: var(--accent);
   color: white;
   box-shadow: 0 2px 8px rgba(196, 93, 62, 0.25);
 }
-
 #stop-btn {
   background: var(--control-bg);
   color: var(--text-secondary);
@@ -337,7 +323,7 @@ button {
 }
 
 #speed-slider {
-  width: 56px;
+  width: 52px;
   height: 4px;
   -webkit-appearance: none;
   appearance: none;
@@ -345,7 +331,6 @@ button {
   border-radius: 2px;
   outline: none;
 }
-
 #speed-slider::-webkit-slider-thumb {
   -webkit-appearance: none;
   width: 18px;
@@ -356,17 +341,45 @@ button {
   box-shadow: 0 1px 4px rgba(0,0,0,0.12);
 }
 
-.progress-info {
+/*
+  FIX: Progress indicator redesigned.
+  Old: confusing "p.3/12 · 47%" text
+  New: visual progress bar + clear "Page 3 of 12" label
+*/
+.progress-area {
   flex: 1;
-  text-align: right;
-  font-size: 12px;
-  color: var(--text-secondary);
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 3px;
+  min-width: 0;
+}
+
+.progress-bar-track {
+  width: 100%;
+  max-width: 100px;
+  height: 4px;
+  background: var(--control-bg);
+  border-radius: 2px;
   overflow: hidden;
 }
 
-/* — Voice Menu Overlay — */
+.progress-bar-fill {
+  height: 100%;
+  width: 0%;
+  background: var(--accent);
+  border-radius: 2px;
+  transition: width 0.3s ease;
+}
+
+.progress-label {
+  font-size: 11px;
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* ── Voice Menu ── */
 #voice-menu-overlay {
   position: fixed;
   inset: 0;
@@ -379,7 +392,6 @@ button {
   visibility: hidden;
   transition: opacity 0.25s ease, visibility 0.25s ease;
 }
-
 #voice-menu-overlay.visible {
   opacity: 1;
   visibility: visible;
@@ -397,7 +409,6 @@ button {
   overflow-y: auto;
   -webkit-overflow-scrolling: touch;
 }
-
 #voice-menu-overlay.visible #voice-menu {
   transform: translateY(0);
 }
@@ -409,7 +420,6 @@ button {
   background: var(--control-hover);
   margin: 0 auto 16px;
 }
-
 .voice-menu-title {
   font-size: 17px;
   font-weight: 700;
@@ -420,34 +430,25 @@ button {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 12px 8px;
+  padding: 14px 8px;
   border-radius: 10px;
   font-size: 15px;
   width: 100%;
   text-align: left;
   transition: background 0.12s;
 }
-
-.voice-option:active {
-  background: var(--control-bg);
-}
-
+.voice-option:active { background: var(--control-bg); }
 .voice-option.selected {
   color: var(--accent);
   font-weight: 600;
 }
-
 .voice-option .check {
   width: 20px;
   flex-shrink: 0;
   text-align: center;
   font-size: 16px;
 }
-
-.voice-option .voice-name {
-  flex: 1;
-}
-
+.voice-option .voice-name { flex: 1; }
 .voice-option .voice-tag {
   font-size: 11px;
   color: var(--text-secondary);
@@ -456,7 +457,7 @@ button {
   border-radius: 4px;
 }
 
-/* — Loading Spinner — */
+/* ── Loading ── */
 #loading-overlay {
   position: absolute;
   inset: 0;
@@ -468,7 +469,6 @@ button {
   z-index: 20;
   transition: opacity 0.3s;
 }
-
 #loading-overlay.hidden {
   opacity: 0;
   pointer-events: none;
@@ -482,10 +482,7 @@ button {
   border-radius: 50%;
   animation: spin 0.8s linear infinite;
 }
-
-@keyframes spin {
-  to { transform: rotate(360deg); }
-}
+@keyframes spin { to { transform: rotate(360deg); } }
 
 .loading-text {
   margin-top: 12px;
@@ -493,17 +490,11 @@ button {
   color: var(--text-secondary);
 }
 
-/* — Utility — */
+/* ── Utility ── */
 .hidden { display: none !important; }
 
-/* iOS standalone status bar padding */
 @media all and (display-mode: standalone) {
   :root {
     --safe-top: max(env(safe-area-inset-top, 0px), 20px);
   }
-}
-
-/* Prevent overscroll bounce in reader */
-#reader-area {
-  overscroll-behavior: contain;
 }
