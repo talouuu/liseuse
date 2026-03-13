@@ -1,14 +1,9 @@
-// Liseuse v2 – PDF → text → AI voice reader
-// - Uses PDF.js from CDN (already loaded on window.pdfjsLib)
-// - Uses kokoro-js (ONNX in browser) for natural AI TTS
-// - Renders pages as text blocks; tap a word to start reading from there
+// Liseuse – PDF → text → Kokoro AI voice reader
+// Uses PDF.js (CDN) + kokoro-js (in-browser neural TTS, Apache 2.0)
 
 (() => {
   const pdfjsLib = window.pdfjsLib;
-  if (!pdfjsLib) {
-    console.error('PDF.js not loaded');
-    return;
-  }
+  if (!pdfjsLib) { console.error('PDF.js not loaded'); return; }
 
   const openBtn = document.getElementById('open-btn');
   const emptyOpenBtn = document.getElementById('empty-open-btn');
@@ -21,18 +16,16 @@
   const speedDisplay = document.getElementById('speed-display');
   const statusText = document.getElementById('status-text');
 
-  // Flattened list of all words with references to DOM spans
-  const words = []; // { text, span, pageIndex }
+  const words = [];
   let currentWordIndex = null;
 
-  // Kokoro TTS state
   let ttsInstance = null;
   let isModelLoaded = false;
   let isModelLoading = false;
-  let audioCtx = null;
-  let currentSource = null;
+  let currentAudio = null;
   let stopRequested = false;
   let isPaused = false;
+  let isPlaying = false;
   let rate = 1.0;
 
   function resetState() {
@@ -45,13 +38,8 @@
     stopBtn.disabled = true;
   }
 
-  function openFilePicker() {
-    fileInput.value = '';
-    fileInput.click();
-  }
-
-  openBtn.addEventListener('click', openFilePicker);
-  emptyOpenBtn.addEventListener('click', openFilePicker);
+  openBtn.addEventListener('click', () => { fileInput.value = ''; fileInput.click(); });
+  emptyOpenBtn.addEventListener('click', () => { fileInput.value = ''; fileInput.click(); });
 
   fileInput.addEventListener('change', async (e) => {
     const file = e.target.files[0];
@@ -59,43 +47,33 @@
     resetState();
     statusText.textContent = 'Loading PDF…';
     emptyState.style.display = 'none';
-
     try {
-      const arrayBuffer = await file.arrayBuffer();
-      await loadPdf(arrayBuffer);
+      const buf = await file.arrayBuffer();
+      const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+      for (let i = 1; i <= pdf.numPages; i++) {
+        const page = await pdf.getPage(i);
+        const tc = await page.getTextContent();
+        renderPage(tc, i - 1);
+      }
       statusText.textContent = 'Tap a word to start reading';
       playPauseBtn.disabled = false;
       stopBtn.disabled = false;
     } catch (err) {
-      console.error('Failed to load PDF', err);
+      console.error('PDF load error', err);
       statusText.textContent = 'Could not load PDF';
       emptyState.style.display = 'flex';
     }
   });
 
-  async function loadPdf(arrayBuffer) {
-    const loadingTask = pdfjsLib.getDocument({ data: arrayBuffer });
-    const pdf = await loadingTask.promise;
-
-    for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
-      const page = await pdf.getPage(pageNum);
-      const textContent = await page.getTextContent();
-      renderPage(textContent, pageNum - 1);
-    }
-  }
-
   function renderPage(textContent, pageIndex) {
-    const pageDiv = document.createElement('div');
-    pageDiv.className = 'page';
-
+    const div = document.createElement('div');
+    div.className = 'page';
     const frag = document.createDocumentFragment();
 
-    textContent.items.forEach((item, itemIdx) => {
+    textContent.items.forEach((item, idx) => {
       const str = item.str || '';
       if (!str.trim()) return;
-
-      const parts = str.split(/(\s+)/);
-      parts.forEach((part) => {
+      str.split(/(\s+)/).forEach((part) => {
         if (!part) return;
         if (/\s+/.test(part)) {
           frag.appendChild(document.createTextNode(part));
@@ -103,30 +81,24 @@
           const span = document.createElement('span');
           span.textContent = part;
           span.className = 'word';
-          const index = words.length;
+          const wi = words.length;
           words.push({ text: part, span, pageIndex });
-          span.dataset.index = String(index);
-          span.addEventListener('click', () => {
-            onWordClick(index);
-          });
+          span.dataset.index = String(wi);
+          span.addEventListener('click', () => onWordClick(wi));
           frag.appendChild(span);
         }
       });
-
-      // Try to keep item boundaries roughly as line breaks for readability
-      if (itemIdx < textContent.items.length - 1) {
+      if (idx < textContent.items.length - 1) {
         frag.appendChild(document.createTextNode(' '));
       }
     });
 
-    pageDiv.appendChild(frag);
-
-    const pageNumLabel = document.createElement('div');
-    pageNumLabel.className = 'page-number';
-    pageNumLabel.textContent = `Page ${pageIndex + 1}`;
-    pageDiv.appendChild(pageNumLabel);
-
-    pagesContainer.appendChild(pageDiv);
+    div.appendChild(frag);
+    const label = document.createElement('div');
+    label.className = 'page-number';
+    label.textContent = `Page ${pageIndex + 1}`;
+    div.appendChild(label);
+    pagesContainer.appendChild(div);
   }
 
   function clearActiveWord() {
@@ -140,176 +112,195 @@
     clearActiveWord();
     words[index].span.classList.add('active');
     words[index].span.scrollIntoView({ behavior: 'smooth', block: 'center' });
-
-    // Immediately start reading from this word with AI voice
     startReadingFrom(index);
   }
 
-  function buildTextFromIndex(startIndex, maxChars = 8000) {
-    let collected = '';
+  function collectText(startIndex, maxChars) {
+    let out = '';
     for (let i = startIndex; i < words.length; i++) {
-      const w = words[i];
-      if (!w) continue;
-      const candidate = collected ? collected + ' ' + w.text : w.text;
-      if (candidate.length > maxChars) break;
-      collected = candidate;
+      const next = out ? out + ' ' + words[i].text : words[i].text;
+      if (next.length > maxChars) break;
+      out = next;
     }
-    return collected;
+    return out;
   }
 
-  function ensureAudioContext() {
-    if (!audioCtx) {
-      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  function splitSentences(text, maxLen) {
+    if (text.length <= maxLen) return [text];
+    const chunks = [];
+    let rest = text;
+    while (rest.length > 0) {
+      if (rest.length <= maxLen) { chunks.push(rest); break; }
+      let cut = -1;
+      for (const sep of ['. ', '! ', '? ', '; ']) {
+        const idx = rest.lastIndexOf(sep, maxLen);
+        if (idx > 30) { cut = idx + sep.length; break; }
+      }
+      if (cut < 0) {
+        const sp = rest.lastIndexOf(' ', maxLen);
+        cut = sp > 30 ? sp + 1 : maxLen;
+      }
+      chunks.push(rest.slice(0, cut).trim());
+      rest = rest.slice(cut).trim();
     }
-    if (audioCtx.state === 'suspended') {
-      audioCtx.resume();
-    }
+    return chunks.filter(Boolean);
   }
 
-  async function loadKokoroModel() {
-    if (isModelLoaded || isModelLoading) return;
+  async function loadModel() {
+    if (isModelLoaded) return true;
+    if (isModelLoading) {
+      while (isModelLoading) await new Promise(r => setTimeout(r, 200));
+      return isModelLoaded;
+    }
     isModelLoading = true;
-    statusText.textContent = 'Downloading AI voice model…';
+    statusText.textContent = 'Downloading AI voice model (~86 MB, one-time)…';
+
     try {
       const { KokoroTTS } = await import('https://esm.sh/kokoro-js@1.2.1');
+
+      // Try WebGPU first for speed, fall back to WASM
+      let device = 'wasm';
+      let dtype = 'q8';
+      if (typeof navigator !== 'undefined' && navigator.gpu) {
+        try {
+          const adapter = await navigator.gpu.requestAdapter();
+          if (adapter) { device = 'webgpu'; dtype = 'fp32'; }
+        } catch (e) {}
+      }
+
+      statusText.textContent = `Loading AI voice (${device})…`;
       ttsInstance = await KokoroTTS.from_pretrained(
         'onnx-community/Kokoro-82M-v1.0-ONNX',
-        { dtype: 'q8', device: 'wasm' }
+        { dtype, device }
       );
       isModelLoaded = true;
-      statusText.textContent = 'AI voice ready. Tap a word.';
+      statusText.textContent = 'AI voice ready';
+      return true;
     } catch (e) {
-      console.error('Kokoro load failed', e);
-      statusText.textContent = 'Failed to load AI voice';
+      console.error('Kokoro load failed:', e);
+      statusText.textContent = 'Failed to load AI voice: ' + e.message;
+      return false;
     } finally {
       isModelLoading = false;
     }
   }
 
-  async function speakChunk(text) {
-    if (!ttsInstance || !text || text.trim().length === 0) return;
-    stopRequested = false;
-
-    // Generate audio
-    const result = await ttsInstance.generate(text, {
-      voice: 'af_heart',
-      speed: rate,
-    });
-    if (stopRequested) return;
-
-    const blob = result.toBlob();
-    const arrayBuf = await blob.arrayBuffer();
-    if (stopRequested) return;
-
-    const audioBuffer = await audioCtx.decodeAudioData(arrayBuf);
-    if (stopRequested) return;
-
+  function playBlob(blob) {
     return new Promise((resolve) => {
-      currentSource = audioCtx.createBufferSource();
-      currentSource.buffer = audioBuffer;
-      currentSource.connect(audioCtx.destination);
-      currentSource.onended = () => {
-        currentSource = null;
-        resolve();
+      const url = URL.createObjectURL(blob);
+      const audio = new Audio(url);
+      currentAudio = audio;
+      audio.onended = () => {
+        URL.revokeObjectURL(url);
+        if (currentAudio === audio) currentAudio = null;
+        resolve('ended');
       };
-      currentSource.start(0);
+      audio.onerror = () => {
+        URL.revokeObjectURL(url);
+        if (currentAudio === audio) currentAudio = null;
+        resolve('error');
+      };
+      audio.play().catch(() => {
+        URL.revokeObjectURL(url);
+        if (currentAudio === audio) currentAudio = null;
+        resolve('play-failed');
+      });
     });
-  }
-
-  function splitIntoChunks(text, maxLen) {
-    if (text.length <= maxLen) return [text];
-    const chunks = [];
-    let remaining = text;
-    while (remaining.length > 0) {
-      if (remaining.length <= maxLen) {
-        chunks.push(remaining);
-        break;
-      }
-      let splitAt = maxLen;
-      const puncts = ['. ', '! ', '? ', '; ', ', '];
-      for (const p of puncts) {
-        const idx = remaining.lastIndexOf(p, maxLen);
-        if (idx > maxLen * 0.3) {
-          splitAt = idx + p.length;
-          break;
-        }
-      }
-      chunks.push(remaining.slice(0, splitAt).trim());
-      remaining = remaining.slice(splitAt).trim();
-    }
-    return chunks.filter(Boolean);
   }
 
   async function startReadingFrom(startIndex) {
     if (!words.length) return;
-    if (startIndex == null || startIndex < 0 || startIndex >= words.length) {
-      startIndex = 0;
-    }
+    if (startIndex == null || startIndex < 0) startIndex = 0;
+    if (startIndex >= words.length) return;
+
+    // Cancel any current playback
+    doStop();
+    stopRequested = false;
+    isPlaying = true;
     currentWordIndex = startIndex;
 
-    const text = buildTextFromIndex(startIndex, 8000);
-    if (!text) return;
+    // Load the model (first time only)
+    const ok = await loadModel();
+    if (!ok || stopRequested) { isPlaying = false; return; }
 
-    ensureAudioContext();
-    await loadKokoroModel();
-    if (!isModelLoaded) return;
+    // Collect text from the tapped word onward, split into short sentences
+    const text = collectText(startIndex, 2000);
+    if (!text) { isPlaying = false; return; }
 
-    isPaused = false;
+    const sentences = splitSentences(text, 150);
     playPauseBtn.textContent = '⏸';
-    statusText.textContent = 'Reading with AI voice…';
 
-    const chunks = splitIntoChunks(text, 400);
-    for (const chunk of chunks) {
+    for (let i = 0; i < sentences.length; i++) {
       if (stopRequested) break;
-      // Respect pause by polling
+
+      // Wait while paused
       while (isPaused && !stopRequested) {
         await new Promise(r => setTimeout(r, 150));
       }
       if (stopRequested) break;
-      await speakChunk(chunk);
+
+      statusText.textContent = `Generating… (${i + 1}/${sentences.length})`;
+
+      try {
+        const result = await ttsInstance.generate(sentences[i], {
+          voice: 'af_heart',
+          speed: rate,
+        });
+        if (stopRequested) break;
+
+        const blob = result.toBlob();
+        statusText.textContent = `Reading… (${i + 1}/${sentences.length})`;
+        const outcome = await playBlob(blob);
+        if (stopRequested) break;
+      } catch (e) {
+        console.warn('TTS generate/play error:', e);
+        statusText.textContent = 'Generation error, skipping…';
+      }
     }
 
+    isPlaying = false;
     if (!stopRequested) {
       playPauseBtn.textContent = '▶';
       statusText.textContent = 'Finished';
     }
   }
 
-  playPauseBtn.addEventListener('click', async () => {
+  function doStop() {
+    stopRequested = true;
+    isPaused = false;
+    if (currentAudio) {
+      try { currentAudio.pause(); currentAudio.currentTime = 0; } catch (e) {}
+      currentAudio = null;
+    }
+    isPlaying = false;
+    playPauseBtn.textContent = '▶';
+    statusText.textContent = 'Stopped';
+  }
+
+  playPauseBtn.addEventListener('click', () => {
     if (!words.length) return;
 
-    // If currently playing, toggle pause
-    if (currentSource && !isPaused) {
+    if (isPlaying && !isPaused) {
       isPaused = true;
+      if (currentAudio) currentAudio.pause();
       playPauseBtn.textContent = '▶';
       statusText.textContent = 'Paused';
       return;
     }
 
-    // Resume
-    if (currentSource && isPaused) {
+    if (isPlaying && isPaused) {
       isPaused = false;
+      if (currentAudio) currentAudio.play().catch(() => {});
       playPauseBtn.textContent = '⏸';
       statusText.textContent = 'Reading…';
       return;
     }
 
-    // Start fresh from last tapped word or from beginning
-    const startIndex = currentWordIndex != null ? currentWordIndex : 0;
-    stopRequested = false;
-    await startReadingFrom(startIndex);
+    const idx = currentWordIndex != null ? currentWordIndex : 0;
+    startReadingFrom(idx);
   });
 
-  stopBtn.addEventListener('click', () => {
-    stopRequested = true;
-    if (currentSource) {
-      try { currentSource.stop(); } catch (e) {}
-      currentSource = null;
-    }
-    isPaused = false;
-    playPauseBtn.textContent = '▶';
-    statusText.textContent = 'Stopped';
-  });
+  stopBtn.addEventListener('click', doStop);
 
   speedSlider.addEventListener('input', () => {
     rate = parseFloat(speedSlider.value) || 1.0;
